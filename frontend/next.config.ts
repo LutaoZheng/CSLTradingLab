@@ -17,11 +17,17 @@ if (existsSync(rootEnvPath)) {
   }
 }
 
+const publicEnv: Record<string, string> = {};
+for (const key of ['NEXT_PUBLIC_API_URL', 'NEXT_PUBLIC_WS_URL'] as const) {
+  // An explicitly empty build environment variable disables a root .env value,
+  // allowing a same-origin production build without changing source code.
+  const processValue = process.env[key];
+  const value = (processValue !== undefined ? processValue : rootEnv[key])?.trim();
+  if (value) publicEnv[key] = value;
+}
+
 const config: NextConfig = {
   output: 'standalone',
-  env: {
-    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || rootEnv.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
-    NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || rootEnv.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000',
-  },
+  env: publicEnv,
 };
 export default config;
