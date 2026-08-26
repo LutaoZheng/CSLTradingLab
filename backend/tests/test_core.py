@@ -146,6 +146,15 @@ async def test_human_event_persistence_timestamps_replay_reference_and_calibrati
     assert data["measurements"][0]["server_receive_to_db_commit_ms"]>=0
     raw_lines=(tmp_path/"raw/match_E"/sid/"human_events.ndjson").read_text().splitlines()
     assert [json.loads(line)["record_type"] for line in raw_lines]==["HUMAN_EVENT","HUMAN_EVENT_PERSISTENCE"]
+    browser_event_id=str(uuid.uuid4()); browser_group_id=str(uuid.uuid4())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app),base_url="http://test") as client:
+        accepted=await client.post(f"/api/sessions/{sid}/events",json={"event_id":browser_event_id,"event_group_id":browser_group_id,"event_type":"BALL_IN_NET","team":"HOME","device_wall_ts_ms":time.time()*1000,"device_perf_ts_ms":101,"pointerdown_perf_ts_ms":99,"calibration_id":None,"detail":{}})
+        assert accepted.status_code==200 and accepted.json()["ok"] is True
+        visible=await client.get(f"/api/sessions/{sid}/data")
+    assert visible.status_code==200
+    assert any(item.get("event_id")==browser_event_id and item.get("label")=="BALL_IN_NET" for item in visible.json()["timeline"])
+    raw_lines=(tmp_path/"raw/match_E"/sid/"human_events.ndjson").read_text().splitlines()
+    assert [json.loads(line)["record_type"] for line in raw_lines]==["HUMAN_EVENT","HUMAN_EVENT_PERSISTENCE","HUMAN_EVENT","HUMAN_EVENT_PERSISTENCE"]
     monkeypatch.setattr(main_module,"engine",eng)
     export_path=tmp_path/"session.zip"
     async with local_maker() as db: session_record=main_module.obj(await db.get(Session,sid))
