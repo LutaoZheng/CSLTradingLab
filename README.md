@@ -1,75 +1,167 @@
-# CSL Trading Lab / 中超现场低延迟实验室
+# CSL Trading Lab
 
-CSL Trading Lab 是一个**研究用途、无交易能力**的中超现场事件记录与 Kalshi 单场行情采集系统。它研究：现场观察者点击真实事件后，Kalshi 可执行订单簿多久开始撤单、暂停或重定价？
+[中文说明](README.zh-CN.md)
 
-> 本项目不下单，不含 BUY/SELL、fair value、概率模型、q、Kelly、bankroll、仓位、PnL 或自动策略。
+CSL Trading Lab is a research and measurement platform for testing whether an on-site human observer at a Chinese Super League match can detect real-world events early enough to obtain a measurable lead over Kalshi market repricing.
 
-## 推荐方式：macOS Native Mode
+It is **not an automated trading bot**. The current production mode is strictly:
 
-第一场实验默认直接使用 Mac 上的 Python、SQLite、Node.js 和 pnpm。**不需要 Docker，也不需要 PostgreSQL。**
-
-### 0. 从零安装系统工具
-
-安装 Xcode Command Line Tools：
-
-```bash
-xcode-select --install
+```text
+MOCK_MODE=false
+TRADING_ENABLED=false
+READ ONLY / RECORDER ONLY
+Order calls = 0
 ```
 
-建议用 Homebrew 安装 Python 3.12、Node.js 和 pnpm：
+Measurement integrity comes first. Trading infrastructure will only be considered if live experiments demonstrate a stable, executable edge after network latency and slippage. No trading edge has been proven yet.
 
-```bash
-brew install python@3.12 node pnpm
-python3 --version
-node --version
-pnpm --version
+## Current status — 2026-08-26
+
+| Capability | Status |
+| --- | --- |
+| Infrastructure validation | PASS |
+| Production deployment | PASS |
+| Kalshi production read path | PASS |
+| Human Event recording and Goal workflow | PASS |
+| Latency instrumentation and clock calibration | PASS |
+| Raw WS, order-book and quote recording | PASS |
+| Sequence integrity test | PASS |
+| 90-minute soak test | PASS |
+| ZIP export | PASS |
+| Trading disabled | PASS |
+
+The next stage is the live stadium experiment. The infrastructure is ready to test whether an edge exists; it does not establish that one exists.
+
+## Architecture
+
+The latency-critical receive loop timestamps Kalshi messages immediately, updates the in-memory book, and hands data to independent consumers. It does not wait for SQLite commits, file flushes, or frontend rendering.
+
+```text
+Kalshi production WS
+        ↓ local_recv_ts_ns
+in-memory order book
+        ↓
+independent async queues
+  ├── append-only raw NDJSON
+  ├── SQLite writer
+  └── coalesced browser updates
+
+Phone Human Event → FastAPI → append-only SQLite + human NDJSON
 ```
 
-后端需要 Python 3.11 或更高版本。
+Score is currently manual and isolated from the market recorder. Focus Mode subscribes only to the selected match's `ticker`, `trade`, and `orderbook_delta` channels. Low-frequency discovery can add newly listed GAME, BTTS, TOTAL, or SPREAD markets without restarting the recorder.
 
-### 1. 配置环境
+### AWS production
+
+```text
+AWS EC2 — us-east-2 / Ohio
+Ubuntu Server 26.04 LTS
+t3.small — 2 vCPU / 2 GB RAM
+
+Internet
+   ↓
+Nginx
+   ├── /        → Next.js standalone :3000
+   ├── /api/*   → FastAPI :8000
+   └── /ws      → FastAPI WebSocket :8000/ws
+```
+
+Services are `csl-backend.service`, `csl-frontend.service`, and `nginx`.
+
+Frontend production networking is same-origin. With no explicit development override, API requests use `/api/*`; browser WebSocket resolution is automatic:
+
+```text
+HTTP  → ws://current-host/ws
+HTTPS → wss://current-host/ws
+```
+
+Moving from IP to domain to HTTPS/WSS does not require another frontend networking redesign. Local development may still explicitly set `NEXT_PUBLIC_API_URL=http://localhost:8000` and `NEXT_PUBLIC_WS_URL=ws://localhost:8000`.
+
+## Latency instrumentation
+
+`POST /api/latency/ping` is a small, side-effect-free endpoint. It does not create or modify Sessions, write Human Events, call Kalshi, access credentials, or trigger trading.
+
+`RUN LATENCY TEST` performs 20 sequential pings and retains the raw samples. It reports RTT last/p50/p95/p99, estimated one-way latency, clock offset, and jitter. Calibrations are stored separately from business events and exported as `clock_calibrations.json`.
+
+Human Events preserve the original clocks and persistence milestones:
+
+```text
+device_wall_ts_ms
+device_perf_ts_ms
+pointerdown_perf_ts_ms
+server_request_entry_ts_ns
+server_receive_ts_ns
+db_commit_complete_ts_ns
+human_raw_fsync_complete_ts_ns
+calibration_id
+```
+
+Replay defaults to `reference=server` and also supports `reference=device` and `reference=calibrated`. The strongest core comparison is:
+
+```text
+AWS Human Event receive
+→ AWS-received Kalshi market reaction
+```
+
+Both timestamps use the same server wall clock. Raw device timestamps and calibration samples are retained rather than replaced by derived latency values.
+
+## Recorded data semantics
+
+- **Raw Kalshi WS:** every received payload with local receive timestamp, append-only and unsampled.
+- **Order book:** snapshots, deltas, sequence, market, side, price-level quantity/depth changes, reconnect and resync evidence. A delta is an aggregate price-level depth change, not an individual user's order. With a snapshot and continuous deltas, the visible book can be reconstructed when the stream is complete.
+- **Quotes:** top-of-book YES bid/ask and NO bid/ask reconstructed from the book, with RAW/DERIVED provenance. Quote timing remains distinct from order-book timing.
+- **Trades:** observed exchange trades using the fields provided by the production payload.
+- **Human Events:** append-only events including `DANGER`, `SHOT`, `BALL_IN_NET`, `GOAL_ASSESSMENT`, `GOAL_CONFIRMED`, `GOAL_CANCELLED`, `PENALTY_EVENT`, `PENALTY_ASSESSMENT`, `PENALTY_CONFIRMED`, `PENALTY_CANCELLED`, `RED_CARD_EVENT`, `RED_CARD_ASSESSMENT`, `RED_CARD_CONFIRMED`, `RED_CARD_CANCELLED`, `VAR_CHECK`, and `EVENT_VOIDED`. Relationships use `event_group_id`, `parent_event_id`, and `target_event_id`; mistaps append a void event instead of deleting history.
+
+Session ZIP export includes `session.json`, `manifest.json`, `clock_calibrations.json`, `timeline.csv`, `human_events.csv`, `quotes.csv`, `trades.csv`, `orderbook_events.csv`, and the Session's raw Kalshi/Human Event NDJSON files.
+
+## Production validation — 2026-08-26
+
+The backend, frontend, and Nginx services were active. Production validation confirmed:
+
+- DANGER and SHOT reached the DATA timeline.
+- `BALL_IN_NET → assessment / VAR_CHECK → GOAL_CONFIRMED` remained append-only and visible.
+- Queue Drops = 0 and DB Failures = 0 in the observed runs.
+- A production latency sample showed typical estimated phone-to-Ohio one-way latency around **145–160 ms**, with meaningful tail latency and jitter on both Wi-Fi and 5G. This is an observation, not an SLA or formal benchmark.
+- AWS request entry to persistence was generally on the order of 10–20 ms in the observed samples.
+- Device and server wall clocks can differ materially; raw wall-clock subtraction is not treated as calibrated latency.
+
+A roughly 90-minute production TEST soak recorded:
+
+```text
+Raw Kalshi WS       234
+Orderbook Events    201
+Quotes              227
+Trades              0
+Human Events         0
+Queue Drops           0
+DB Write Failures     0
+Orderbook sequence    1 → 201 (201 unique; 0 missing observed)
+```
+
+The recorder ran through STOP, ZIP export succeeded, raw WS/BOOK/QUOTE data were present, and trading stayed disabled. This is evidence from one soak test, not a guarantee of production stability.
+
+## Recent engineering fixes
+
+- The App Router DATA page at `/match/[id]/data` was restored after the broad `data/` ignore rule accidentally excluded `frontend/app/match/[id]/data/`. Production builds now contain the route.
+- Bare HTTP is a non-secure browser context, so direct `crypto.randomUUID()` use caused Human Event clicks to throw before optimistic UI or POST, leaving DATA empty and breaking Goal follow-up. A unified helper now prefers `crypto.randomUUID()`, falls back to `crypto.getRandomValues()`, then to local browser-safe UUID generation. These UUIDs identify records; they are not authentication or security tokens. Human Event and Goal workflows were regression-tested over the fallback path.
+
+## Local Native Mode
+
+Native macOS development uses Python, SQLite, Node.js, and pnpm; Docker and PostgreSQL are not required.
 
 ```bash
 cd "/Users/lutaozheng/Documents/CSL Trading Lab"
 cp .env.example .env
-```
 
-默认配置是：
-
-```dotenv
-MOCK_MODE=true
-DATABASE_URL=sqlite+aiosqlite:///./data/csl_trading_lab.db
-DATA_DIR=./data
-NEXT_PUBLIC_API_URL=http://localhost:8000
-NEXT_PUBLIC_WS_URL=ws://localhost:8000
-```
-
-相对路径始终按项目根目录解析，因此无论从根目录还是 `backend/` 启动，数据库和 raw log 都写入同一个 `data/`。
-
-### 2. 启动 Backend
-
-从全新终端执行：
-
-```bash
-cd "/Users/lutaozheng/Documents/CSL Trading Lab/backend"
+cd backend
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-`0.0.0.0` 允许同一局域网中的手机连接。退出后再次启动只需：
-
-```bash
-cd "/Users/lutaozheng/Documents/CSL Trading Lab/backend"
-source .venv/bin/activate
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-### 3. 启动 Frontend
-
-打开第二个终端：
+In a second terminal:
 
 ```bash
 cd "/Users/lutaozheng/Documents/CSL Trading Lab/frontend"
@@ -77,178 +169,96 @@ pnpm install
 pnpm dev --hostname 0.0.0.0
 ```
 
-Mac 浏览器访问 `http://localhost:3000`。
+Open `http://localhost:3000`. For a phone on the same LAN, bind as above, configure the public frontend API/WS variables to the Mac LAN address, restart Next.js, and open `http://<MAC_LAN_IP>:3000`. `ipconfig getifaddr en0` usually returns the Wi-Fi address.
 
-## 手机通过局域网访问
-
-1. 确保 Mac 和手机连接同一个可信 Wi-Fi。
-2. 查找 Mac 的 Wi-Fi IP：
-
-```bash
-ipconfig getifaddr en0
-```
-
-如果 Mac 使用有线网或该命令无输出，可运行：
-
-```bash
-networksetup -listallhardwareports
-ipconfig getifaddr en1
-```
-
-3. 假设 IP 是 `192.168.1.20`，修改项目根目录 `.env`：
-
-```dotenv
-NEXT_PUBLIC_API_URL=http://192.168.1.20:8000
-NEXT_PUBLIC_WS_URL=ws://192.168.1.20:8000
-```
-
-4. `frontend/next.config.ts` 只从根目录 `.env` 读取这两个公开字段，不会把 Kalshi credential 注入浏览器。前端环境变量在构建/启动时读取；停止并重新运行 `pnpm dev --hostname 0.0.0.0`。
-5. 手机打开 `http://192.168.1.20:3000`。
-6. macOS 防火墙弹窗中允许 Python/Node 接收入站连接。若无法访问，先在手机浏览器测试 `http://192.168.1.20:8000/api/matches`。
-
-公网部署必须使用 HTTPS/WSS；不要把 Kalshi 私钥放入 frontend 或暴露给浏览器。
-
-## Architecture / 架构
+Runtime data is local and ignored by Git:
 
 ```text
-Kalshi WS ── timestamp_ns ── in-memory orderbook ── unbounded queues
-                                                    ├─ append-only NDJSON
-                                                    ├─ async SQLite writer
-                                                    └─ coalesced UI (75 ms)
-Kalshi score adapter (currently MANUAL) ────────────────┘
-Phone event clock ──────── append-only Human Events ────┘
+data/csl_trading_lab.db
+data/raw/match_<EVENT_TICKER>/<SESSION_ID>/kalshi_ws.ndjson
+data/raw/match_<EVENT_TICKER>/<SESSION_ID>/human_events.ndjson
 ```
 
-WS receive loop不等待数据库 commit、文件 flush 或浏览器。raw writer、DB writer 和 UI broadcaster 是独立消费者。UI 可以合并帧；Recorder 不采样。订单簿保存 snapshot 和每个 delta，sequence gap、断线、重连及 resync 都显式记录。
+Run verification with:
 
-## 目录结构与运行时数据
-
-```text
-backend/
-  app/
-    main.py          FastAPI、preflight、events、replay、export
-    kalshi.py        CSL discovery、Focus WS、Mock、Score Adapter
-    recorder.py      raw/DB/UI queues、orderbook reconstruction
-    models.py        append-only schema
-  requirements.txt  Native Mode Python dependencies
-  tests/
-frontend/
-  app/page.tsx
-  app/match/[id]/page.tsx
-  app/replay/[id]/page.tsx
-data/
-  csl_trading_lab.db
-  raw/match_<EVENT_TICKER>/<SESSION_ID>/kalshi_ws.ndjson
-docker-compose.yml   optional deployment only
+```bash
+cd backend && source .venv/bin/activate && python -m pytest -q
+cd ../frontend && pnpm test:regression && pnpm exec tsc --noEmit && pnpm build
 ```
 
-整个 `data/`、SQLite `*.db`、WAL/SHM、raw logs、`.env`、virtualenv、Node modules 均已加入 `.gitignore`。
+Docker files remain optional deployment artifacts only.
 
-## Native Mock 验收
+### Mock validation
 
-保持 `MOCK_MODE=true`，启动 backend/frontend 后：
-
-1. 首页看到唯一的 Mock CSL 比赛并进入 Focus Mode。
-2. Preflight 显示 WS、orderbook、raw recorder、database writer 正常。
-3. 查看实时 ask，点击 Home Goal → 明显有效，或进入 VAR/Cancelled 路径。
-4. `UNDO / MISTAP` 会追加 `EVENT_VOIDED`，不会删除目标事件。
-5. 模拟断线与 resync：
+With `MOCK_MODE=true`, the same UI and recorder architecture can simulate quotes, order-book deltas, disconnect/resync, and newly discovered markets without mixing mock data into a production Session. Useful checks include Human Event append-only behavior, GOAL/VAR follow-up, DATA/Replay, STOP, and ZIP export. The development-only helpers are:
 
 ```bash
 curl -X POST http://localhost:8000/api/mock/disconnect
-```
-
-6. 模拟动态新增 BTTS market：
-
-```bash
 curl -X POST http://localhost:8000/api/mock/new_market
 ```
 
-7. 在 Replay 选择 human event，检查 T−10s 到 T+30s 的真实事件驱动 quote。
-8. 导出 ZIP，确认包含 `events.csv`、`quotes.csv`、`trades.csv`、`orderbook_deltas.csv`、`market_metadata.json`、`session.json` 和 `raw_kalshi_ws.ndjson`。
+## Production read-only configuration
 
-自动测试：
-
-```bash
-cd "/Users/lutaozheng/Documents/CSL Trading Lab/backend"
-source .venv/bin/activate
-PYTHONPATH=. pytest -q
-```
-
-生产前端构建：
-
-```bash
-cd "/Users/lutaozheng/Documents/CSL Trading Lab/frontend"
-pnpm install
-pnpm build
-```
-
-## 连接真实 Kalshi：只读 dry run
-
-修改 `.env`：
+Credentials belong only in the untracked server `.env` and private-key file; never put them in frontend variables, source, fixtures, logs, exports, or Git.
 
 ```dotenv
 MOCK_MODE=false
 TRADING_ENABLED=false
-CSL_SERIES_TICKERS=<当前中超 series ticker，多个用逗号分隔>
-KALSHI_API_KEY_ID=<API key id>
-KALSHI_PRIVATE_KEY_PATH=/绝对路径/kalshi-private-key.pem
+CSL_SERIES_TICKERS=<current CSL series allowlist>
+KALSHI_API_KEY_ID=<server-side key id>
+KALSHI_PRIVATE_KEY_PATH=<absolute server-side PEM path>
 ```
 
-保留以下官方 endpoint，除非 Kalshi 文档更新：
+The backend startup guard rejects `TRADING_ENABLED=true`. The current engine exposes no order methods.
 
-```dotenv
-KALSHI_REST_URL=https://external-api.kalshi.com/trade-api/v2
-KALSHI_WS_URL=wss://external-api-ws.kalshi.com/trade-api/ws/v2
-```
-
-本项目没有订单 endpoint。dry run 前仍需人工确认：
-
-- 当前 CSL series/event ticker、主客队和开球时间。
-- RSA key 文件权限和 API key 有效性。
-- `ticker`、`trade`、`orderbook_delta` subscription acknowledgements/SID。
-- 初始 `orderbook_snapshot`、增量重建、断线后的 snapshot/resync。
-- live derivative market 能在 2–5 秒 discovery 周期内加入现有 WS。
-- 手机与 Mac 的 NTP 时钟偏差、现场网络、磁盘空间、电源和禁用休眠。
-- 所在地适用的 Kalshi/API 条款。
-
-配置完成后，可执行受控的只读 production smoke run。它会等待真实 snapshot/行情、追加并立即 VOID 一个 `TEST_EVENT`、主动关闭一次本地 WS 验证重连/resync，并导出 Session；不会调用任何订单或 portfolio endpoint：
+After manually verifying the current CSL allowlist, server-side key permissions, market identity, disk space, network, and applicable Kalshi/API terms, a controlled read-only smoke run is available:
 
 ```bash
-cd "/Users/lutaozheng/Documents/CSL Trading Lab/backend"
+cd backend
 source .venv/bin/activate
 python scripts/production_dry_run.py
 ```
 
-应用启动时如果发现 `TRADING_ENABLED=true` 会直接拒绝启动。
+It exercises the production read path, reconnect/resync and export. It does not call order or portfolio endpoints.
 
-## Kalshi integration status
+## Live stadium experiment
 
-- REST：`GET /events`、`GET /events/{event_ticker}`；orderbook REST endpoint 可用于初始化/恢复。
-- WS：`ticker`、`trade`、`orderbook_delta`；后者先发 `orderbook_snapshot`。支持同一 socket 动态增加 subscription，无需重启 Recorder。
-- 当前 schema 使用 fixed-point dollar/count 字段，并保存 payload 提供的 `ts_ms`；缺失字段保持 null，不虚构。
-- `CSL_SERIES_TICKERS` 是显式 allowlist；未配置时 Live Mode 不扫描其他联赛。
-- Kalshi 公开 Trade API 没有已确认的足球 score/clock 契约，因此当前 `score_source=MANUAL`、`clock=null`，不运行虚假本地倒计时。
+The experiment will measure:
 
-## SQLite 与可选 PostgreSQL/Docker
-
-Native Mode 只安装 `requirements.txt`，其中没有 `asyncpg` 或 PostgreSQL 依赖。SQLAlchemy 模型使用 SQLite 兼容类型；大整数主键在 SQLite 下映射为 `INTEGER` 以保持自增。
-
-Docker 仅作为未来 optional deployment 保留：
-
-```bash
-docker compose up --build
+```text
+real-world event
+→ human pointerdown / click
+→ AWS Human Event receive
+→ first ANY order-book change
+→ first liquidity/depth reaction
+→ first top-of-book or bid/ask move
+→ first trade
+→ major repricing
 ```
 
-Docker backend 显式安装 `.[postgres]` optional dependency，并由 Compose 覆盖 `DATABASE_URL` 为 PostgreSQL。它不影响 Native Mode。
+Definitions such as “major repricing” are intentionally not hard-coded before observing real data. Raw depth is preserved because liquidity withdrawal may precede a price move.
 
-## Data semantics and limitations
+Decision rule:
 
-- Human event 与状态转换全部 append-only，共享 `event_group_id`；undo 追加 `EVENT_VOIDED`。
-- 手机在请求前记录 wall clock 与 monotonic `performance.now()`；后端时间只作为额外证据。
-- Replay 不插值，返回实际收到的 event-driven updates。
-- 不硬编码“Market Reaction”定义，保留 full depth 供赛后研究。
-- SQLite WAL 可降低读写互相阻塞，但 raw NDJSON 仍是独立冗余记录。OS/filesystem crash 仍可能损失尚未刷盘的尾部数据，比赛前应完成断电与磁盘容量评估。
+```text
+Live data
+   ↓
+Stable measurable lead?
+   ├── NO → stop or change research direction
+   └── YES
+        ↓
+Executable after latency/slippage?
+   ├── NO → do not trade
+   └── YES
+        ↓
+Security hardening → domain → HTTPS/WSS → authentication
+→ trading engine → risk controls → paper shadow execution
+→ only then consider real money
+```
+
+## Security limitations
+
+The current bare-HTTP research deployment is **not suitable for real-money trading**. Before any trading phase it requires HTTPS/WSS, server-side authentication, API authorization, WebSocket authentication, origin validation, CSRF protection, rate limiting, separate recorder/trading credentials, position and market-risk limits, a kill switch, idempotent client order IDs, and an append-only order audit log.
 
 ## Official references
 
