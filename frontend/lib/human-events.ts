@@ -22,6 +22,21 @@ export type PendingEventState = {
   pending: boolean;
 };
 
+export type HumanEventPayload = {
+  event_id: string;
+  event_group_id: string;
+  event_type: string;
+  team?: string;
+  device_wall_ts_ms: number;
+  device_perf_ts_ms?: number;
+  pointerdown_perf_ts_ms?: number;
+  calibration_id: string | null;
+  score_at_click?: unknown;
+  kalshi_match_clock_at_click?: unknown;
+  target_event_id?: unknown;
+  detail: Record<string, unknown>;
+};
+
 type EventDraftInput = {
   eventType: string;
   team?: string;
@@ -86,7 +101,21 @@ export function createHumanEventDraft(input: EventDraftInput, runtime: EventDraf
       kalshi_match_clock_at_click: input.matchClockAtClick,
       target_event_id: detail.target_event_id,
       detail,
-    },
+    } satisfies HumanEventPayload,
+  };
+}
+
+export function humanEventFromPayload(payload: HumanEventPayload): HumanEvent {
+  return {
+    id: payload.event_id,
+    event_group_id: payload.event_group_id,
+    event_type: payload.event_type,
+    team: payload.team,
+    device_wall_ts_ms: payload.device_wall_ts_ms,
+    device_perf_ts_ms: payload.device_perf_ts_ms,
+    pointerdown_perf_ts_ms: payload.pointerdown_perf_ts_ms,
+    target_event_id: payload.target_event_id as string | undefined,
+    detail: payload.detail,
   };
 }
 
