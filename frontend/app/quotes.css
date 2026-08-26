@@ -41,6 +41,8 @@
 .active-recording .toolbar { margin-top: 16px; }
 .confirm-input { width: 100%; margin: 8px 0 12px; padding: 14px; border: 1px solid #555; border-radius: 12px; background: #090a0c; color: white; font-size: 16px; }
 .stop-recording { margin-top: 10px; background: transparent; color: var(--red); border: 1px solid var(--red); }
+.latency-test { padding: 14px; }
+.latency-results { margin-top: 14px; }
 .button:disabled { opacity: .45; cursor: not-allowed; }
 @media(max-width:390px) {
   .event { font-size: 13px; min-height: 76px; padding: 10px 7px; }
