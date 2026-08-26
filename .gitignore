@@ -11,7 +11,8 @@ node_modules/
 .next/
 *.tsbuildinfo
 .DS_Store
-data/
+/data/
+/backend/data/
 *.db
 *.db-shm
 *.db-wal
