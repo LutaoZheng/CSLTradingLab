@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "matches": [
+    {
+      "event_ticker": "EXACT-KALSHI-EVENT-TICKER",
+      "home_team": "CHINA",
+      "away_team": "MALDIVES",
+      "start_time": "2026-09-24T19:00:00+08:00",
+      "timezone": "Asia/Shanghai",
+      "markets": [
+        {
+          "ticker": "EXACT-KALSHI-MARKET-TICKER",
+          "title": "China to win",
+          "group": "MATCH RESULT",
+          "direction": {"CHINA_GOAL": "YES_UP", "MALDIVES_GOAL": "YES_DOWN"},
+          "settlement_rule": "Copy the exact exchange settlement rule here and verify it manually."
+        }
+      ],
+      "allowed_event_buttons": [
+        {"event_type": "BALL_IN_NET", "label": "GOAL", "teams": ["CHINA", "MALDIVES"]},
+        {"event_type": "PENALTY_EVENT", "label": "PENALTY", "teams": ["CHINA", "MALDIVES"]},
+        {"event_type": "RED_CARD_EVENT", "label": "RED CARD", "teams": ["CHINA", "MALDIVES"]},
+        {"event_type": "VAR_CHECK", "label": "VAR", "teams": []},
+        {"event_type": "EVENT_VOIDED", "label": "CORRECTION", "teams": []}
+      ]
+    }
+  ]
+}

@@ -12,6 +12,15 @@ function withLeadingSlash(path: string): string {
 // An empty API base deliberately means browser same-origin.
 export const API = withoutTrailingSlash(configuredApiBase);
 
+export class ApiError extends Error {
+  constructor(public status: number, message: string) { super(message); }
+}
+
+function cookie(name: string): string | undefined {
+  if (typeof document === 'undefined') return undefined;
+  return document.cookie.split(';').map(x => x.trim()).find(x => x.startsWith(`${name}=`))?.slice(name.length + 1);
+}
+
 export function apiUrl(path: string): string {
   return `${API}${withLeadingSlash(path)}`;
 }
@@ -33,27 +42,31 @@ export function getWebSocketUrl(path = '/ws'): string {
 }
 
 export async function getJSON(path: string) {
-  const response = await fetch(apiUrl(path), {cache: 'no-store'});
-  if (!response.ok) throw Error(await response.text());
+  const response = await fetch(apiUrl(path), {cache: 'no-store', credentials: 'include'});
+  if (!response.ok) throw new ApiError(response.status, await response.text());
   return response.json();
 }
 
 export async function postJSON(path: string, body: unknown) {
+  const csrf=cookie('csl_csrf');
   const response = await fetch(apiUrl(path), {
     method: 'POST',
-    headers: {'content-type': 'application/json'},
+    headers: {'content-type': 'application/json', ...(csrf?{'x-csrf-token':decodeURIComponent(csrf)}:{})},
     body: JSON.stringify(body),
+    credentials: 'include',
   });
-  if (!response.ok) throw Error(await response.text());
+  if (!response.ok) throw new ApiError(response.status, await response.text());
   return response.json();
 }
 
 export async function deleteJSON(path: string, body: unknown) {
+  const csrf=cookie('csl_csrf');
   const response = await fetch(apiUrl(path), {
     method: 'DELETE',
-    headers: {'content-type': 'application/json'},
+    headers: {'content-type': 'application/json', ...(csrf?{'x-csrf-token':decodeURIComponent(csrf)}:{})},
     body: JSON.stringify(body),
+    credentials: 'include',
   });
-  if (!response.ok) throw Error(await response.text());
+  if (!response.ok) throw new ApiError(response.status, await response.text());
   return response.json();
 }

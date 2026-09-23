@@ -49,7 +49,7 @@ independent async queues
 Phone Human Event → FastAPI → append-only SQLite + human NDJSON
 ```
 
-比分目前为手动源，并与 Market Recorder 隔离。Focus Mode 只订阅目标比赛的 `ticker`、`trade` 和 `orderbook_delta`。低频 discovery 可以在不重启 Recorder 的情况下加入后来开放的 GAME、BTTS、TOTAL 或 SPREAD 市场。
+比分目前为手动源，并与 Market Recorder 隔离。默认关闭比赛 discovery 和启动时的 focus 恢复。管理员必须先在版本化配置中加入精确 event/market ticker，再明确激活比赛，Focus Mode 才订阅 `ticker`、`trade` 和 `orderbook_delta`。旧的低频 discovery 仍可通过 `AUTO_DISCOVERY_ENABLED=true` 启用，但默认不用。
 
 ### AWS Production
 
@@ -257,6 +257,37 @@ Executable after latency/slippage?
 ```
 
 ## 安全限制
+
+## Phase 3 登录与重庆操作端
+
+系统现在只有一个共享基础账号。基础登录只能访问 `/live/chongqing` 的授权比赛事件界面。原 Dashboard、数据、导出、比分、重连、Session 管理 API、OpenAPI 文档和行情 WebSocket 都要求独立且短时有效的管理员二次验证；权限由 FastAPI 服务端执行，不依赖隐藏按钮。
+
+在服务器上交互式生成基础密码和管理员二次验证密码的 scrypt hash（终端不会显示密码）：
+
+```bash
+cd backend
+.venv/bin/python scripts/generate_password_hash.py
+```
+
+仅在服务器未跟踪的 `.env` 中配置 hash 和精确授权的比赛 ticker：
+
+```dotenv
+PUBLIC_ORIGIN=https://csltradinglab.duckdns.org
+AUTH_USERNAME=<共享用户名>
+AUTH_PASSWORD_HASH=<scrypt hash>
+ADMIN_PASSWORD_HASH=<不同的管理员二次验证密码 hash>
+AUTO_DISCOVERY_ENABLED=false
+MATCH_CONFIG_PATH=./config/matches.v1.json
+TRADING_ENABLED=false
+NEXT_PUBLIC_API_URL=
+NEXT_PUBLIC_WS_URL=
+```
+
+Production frontend build 必须显式保持两个 public base 变量为空，使 HTTPS 下的 API/WS 使用 same-origin。Session token 是服务端保存、可撤销的 opaque token；Cookie 使用 Secure、HttpOnly、SameSite=Strict，所有修改请求还要求匹配的 CSRF cookie/header 和精确 Origin。
+
+补传会保留原始 event ID 和时间戳；超过 `REALTIME_SIGNAL_MAX_AGE_MS` 的事件仍用于研究，但保存为 `realtime_eligible=false`，未来 execution 必须对此 fail closed。
+
+比赛定义位于 schema version 1 的 `config/matches.v1.json`。默认文件特意保持为空，因此进程重启后没有 Active Match，也不会自动建立任何 Kalshi 比赛订阅。新增比赛时复制 `config/matches.v1.example.json` 的结构，人工核对精确 event ticker、market ticker、双方、当地开赛时间与时区、事件方向、结算规则及允许按钮，然后由管理员明确激活。精确 event 或任一配置 market 不存在时，激活直接失败，不会匹配相似名称的其他比赛。
 
 当前裸 HTTP 研究部署**不适合真钱交易**。任何交易阶段开始前，都必须增加 HTTPS/WSS、server-side authentication、API authorization、WebSocket authentication、origin validation、CSRF protection、rate limiting、Recorder/Trading credentials 隔离、position/market risk limits、kill switch、幂等 client order ID 和 append-only order audit log。
 

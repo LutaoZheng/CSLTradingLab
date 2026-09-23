@@ -49,7 +49,7 @@ independent async queues
 Phone Human Event → FastAPI → append-only SQLite + human NDJSON
 ```
 
-Score is currently manual and isolated from the market recorder. Focus Mode subscribes only to the selected match's `ticker`, `trade`, and `orderbook_delta` channels. Low-frequency discovery can add newly listed GAME, BTTS, TOTAL, or SPREAD markets without restarting the recorder.
+Score is currently manual and isolated from the market recorder. Match discovery and focus restoration are disabled by default. An administrator must add exact event/market tickers to the versioned match configuration and explicitly activate the match before Focus Mode subscribes to `ticker`, `trade`, and `orderbook_delta`. Legacy low-frequency discovery remains available behind `AUTO_DISCOVERY_ENABLED=true` but is not used by default.
 
 ### AWS production
 
@@ -257,6 +257,55 @@ Security hardening → domain → HTTPS/WSS → authentication
 ```
 
 ## Security limitations
+
+## Phase 3 authentication and Chongqing operator surface
+
+The application now uses one shared base account. A base login can only use the
+authorized field-event surface at `/live/chongqing`. Existing dashboard, data,
+export, score, reconnect, session-management APIs, OpenAPI documentation, and
+the market-data WebSocket require a separate short-lived administrator
+verification. Authorization is enforced by FastAPI, not by page visibility.
+
+Generate the two password hashes interactively (the password is not echoed):
+
+```bash
+cd backend
+.venv/bin/python scripts/generate_password_hash.py
+```
+
+Configure the resulting hashes and the exact authorized event ticker only in
+the server's untracked `.env`:
+
+```dotenv
+PUBLIC_ORIGIN=https://csltradinglab.duckdns.org
+AUTH_USERNAME=<shared username>
+AUTH_PASSWORD_HASH=<scrypt hash>
+ADMIN_PASSWORD_HASH=<different scrypt hash used for administrator re-verification>
+AUTO_DISCOVERY_ENABLED=false
+MATCH_CONFIG_PATH=./config/matches.v1.json
+TRADING_ENABLED=false
+NEXT_PUBLIC_API_URL=
+NEXT_PUBLIC_WS_URL=
+```
+
+Production frontend builds must keep both public base variables explicitly
+empty so API and WebSocket traffic remain same-origin under HTTPS. Sessions are
+opaque, server-side, revocable records. The session cookie is Secure, HttpOnly,
+and SameSite=Strict; state-changing requests additionally require the matching
+CSRF cookie/header and exact configured Origin.
+
+An operator retry preserves its event ID and original clocks. Events delivered
+outside `REALTIME_SIGNAL_MAX_AGE_MS` are retained for research but marked
+`realtime_eligible=false`; future execution code must fail closed on that flag.
+
+Match definitions live in `config/matches.v1.json` using schema version 1. The
+default file is intentionally empty, so a restart has no active match and opens
+no Kalshi subscription. Copy the example structure from
+`config/matches.v1.example.json`, verify the exact Kalshi event and market
+tickers, teams, local start time/timezone, event-direction mapping, settlement
+rules, and allowed buttons, then activate it from the administrator dashboard.
+If the exact event or any configured market is absent, activation fails without
+falling back to a similarly named event.
 
 The current bare-HTTP research deployment is **not suitable for real-money trading**. Before any trading phase it requires HTTPS/WSS, server-side authentication, API authorization, WebSocket authentication, origin validation, CSRF protection, rate limiting, separate recorder/trading credentials, position and market-risk limits, a kill switch, idempotent client order IDs, and an append-only order audit log.
 

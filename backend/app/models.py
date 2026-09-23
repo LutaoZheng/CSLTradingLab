@@ -88,6 +88,12 @@ class HumanEvent(Base):
     event_type: Mapped[str] = mapped_column(String); team: Mapped[str | None] = mapped_column(String)
     score_at_click: Mapped[dict | None] = mapped_column(JSON); kalshi_match_clock_at_click: Mapped[str | None] = mapped_column(String)
     target_event_id: Mapped[str | None] = mapped_column(String); detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    client_enqueue_perf_ts_ms: Mapped[float | None] = mapped_column(Float)
+    client_fetch_start_perf_ts_ms: Mapped[float | None] = mapped_column(Float)
+    client_ack_perf_ts_ms: Mapped[float | None] = mapped_column(Float)
+    client_ack_wall_ts_ms: Mapped[float | None] = mapped_column(Float)
+    operator_session_id: Mapped[str | None] = mapped_column(String, index=True)
+    realtime_eligible: Mapped[bool] = mapped_column(Boolean, default=False)
 
 class ClockCalibration(Base):
     __tablename__ = "clock_calibrations"
@@ -108,3 +114,16 @@ class SystemEvent(Base):
     __tablename__ = "system_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True); session_id: Mapped[str] = mapped_column(String, index=True)
     timestamp_ns: Mapped[int] = mapped_column(BigInteger); kind: Mapped[str] = mapped_column(String); detail: Mapped[dict] = mapped_column(JSON)
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    csrf_hash: Mapped[str] = mapped_column(String)
+    created_at_ns: Mapped[int] = mapped_column(BigInteger)
+    expires_at_ns: Mapped[int] = mapped_column(BigInteger, index=True)
+    last_seen_at_ns: Mapped[int] = mapped_column(BigInteger)
+    remembered: Mapped[bool] = mapped_column(Boolean, default=False)
+    revoked_at_ns: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    admin_verified_until_ns: Mapped[int | None] = mapped_column(BigInteger)
+    user_agent: Mapped[str] = mapped_column(String, default="")

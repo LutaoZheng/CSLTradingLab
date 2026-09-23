@@ -59,6 +59,15 @@ class Discovery:
             d=r.json(); e=d["event"]; e["markets"]=e.get("markets") or d.get("markets",[]); base=self._normalize(e)
         related=await self.related_markets(base)
         base["markets"]=related; return base
+    async def event_exact(self,ticker):
+        """Fetch one exact Kalshi event without fuzzy related-market discovery."""
+        if self.cfg.mock_mode: return MOCK_EVENT
+        async with httpx.AsyncClient(timeout=10) as c:
+            r=await c.get(f"{self.cfg.kalshi_rest_url}/events/{ticker}",params={"with_nested_markets":"true"}); r.raise_for_status()
+            d=r.json(); e=d["event"]
+            if e.get("event_ticker")!=ticker: raise RuntimeError("Kalshi returned a different event ticker")
+            e["markets"]=e.get("markets") or d.get("markets",[])
+            return self._normalize(e)
     async def related_markets(self,base):
         found={m["ticker"]:m for m in base["markets"]}; target={base["home_team"],base["away_team"]}
         async with httpx.AsyncClient(timeout=20) as c:
@@ -121,7 +130,9 @@ class KalshiEngine:
         log.info("FOCUS_SESSION event_ticker=%s session_id=%s",self.focus,self.session_id)
         log.info("WS_SUBSCRIPTIONS focus_markets=%d other_game_markets=0 tickers=%s",len(self.markets),sorted(self.markets))
         log.info("DISCOVERY %s",self._family_counts())
-        await self._persist_markets(event["markets"]); self.task=asyncio.create_task(self._run()); self.discovery_task=asyncio.create_task(self._discover())
+        await self._persist_markets(event["markets"]); self.task=asyncio.create_task(self._run())
+        self.discovery_task=asyncio.create_task(self._discover()) if self.cfg.auto_discovery_enabled else None
+        if not self.cfg.auto_discovery_enabled: self.dynamic_discovery_ok=False; self.discovery_error=None
     async def stop(self):
         self.stop_flag=True
         for t in (self.task,self.discovery_task):
@@ -239,7 +250,7 @@ class KalshiEngine:
         active=session_id is None or session_id==self.session_id
         subscribed=set(self.subscription_requested) if active else set()
         other=sum(1 for ticker in subscribed if self.market_focus.get(ticker)!=self.focus) if active else 0
-        return {"session_id":self.session_id if active else None,"focus_event_ticker":self.focus if active else None,"connected":self.connected if active else False,"auth_ok":self.auth_ok if active else False,"reconnect_count":self.reconnect_count if active else 0,"last_ws_message_age_ms":(time.time_ns()-self.last_message_ns)/1e6 if active and self.last_message_ns else None,"sequence_gap_count":self.recorder.books.gaps if active else 0,"subscriptions":self.subscriptions if active else {},"subscribed_market_count":len(subscribed),"subscribed_tickers":sorted(subscribed),"other_game_markets":other,"market_family_counts":self._family_counts() if active else {x:0 for x in ("GAME","BTTS","TOTAL","SPREAD")},"ticker_subscribed":self.ticker_subscribed if active else False,"trade_subscribed":self.trade_subscribed if active else False,"snapshot_markets":len(self.snapshots) if active else 0,"delta_markets":len(self.deltas_seen) if active else 0,"dynamic_discovery":self.dynamic_discovery_ok if active else False,"discovery_status":("ACTIVE" if self.dynamic_discovery_ok else "ERROR") if active else "INACTIVE","discovery_error":self.discovery_error if active else None,"last_discovery_scan_age_ms":(time.time_ns()-self.last_discovery_scan_ns)/1e6 if active and self.last_discovery_scan_ns else None,"last_discovery_duration_ms":self.last_discovery_duration_ms if active else None,"new_markets_observed":self.new_markets_observed if active else 0,"disconnect_ts_ns":self.disconnect_ts_ns if active else None,"reconnect_ts_ns":self.reconnect_ts_ns if active else None,"resync_complete_ts_ns":self.resync_complete_ts_ns if active else None,"gap_duration_ms":gap_ms if active else None}
+        return {"session_id":self.session_id if active else None,"focus_event_ticker":self.focus if active else None,"connected":self.connected if active else False,"auth_ok":self.auth_ok if active else False,"reconnect_count":self.reconnect_count if active else 0,"last_ws_message_age_ms":(time.time_ns()-self.last_message_ns)/1e6 if active and self.last_message_ns else None,"sequence_gap_count":self.recorder.books.gaps if active else 0,"subscriptions":self.subscriptions if active else {},"subscribed_market_count":len(subscribed),"subscribed_tickers":sorted(subscribed),"other_game_markets":other,"market_family_counts":self._family_counts() if active else {x:0 for x in ("GAME","BTTS","TOTAL","SPREAD")},"ticker_subscribed":self.ticker_subscribed if active else False,"trade_subscribed":self.trade_subscribed if active else False,"snapshot_markets":len(self.snapshots) if active else 0,"delta_markets":len(self.deltas_seen) if active else 0,"dynamic_discovery":self.dynamic_discovery_ok if active else False,"discovery_status":(("ACTIVE" if self.dynamic_discovery_ok else "ERROR") if self.cfg.auto_discovery_enabled else "DISABLED") if active else "INACTIVE","discovery_error":self.discovery_error if active else None,"last_discovery_scan_age_ms":(time.time_ns()-self.last_discovery_scan_ns)/1e6 if active and self.last_discovery_scan_ns else None,"last_discovery_duration_ms":self.last_discovery_duration_ms if active else None,"new_markets_observed":self.new_markets_observed if active else 0,"disconnect_ts_ns":self.disconnect_ts_ns if active else None,"reconnect_ts_ns":self.reconnect_ts_ns if active else None,"resync_complete_ts_ns":self.resync_complete_ts_ns if active else None,"gap_duration_ms":gap_ms if active else None}
     def _family_counts(self):
         counts={x:0 for x in ("GAME","BTTS","TOTAL","SPREAD")}
         for ticker in self.markets:

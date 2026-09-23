@@ -19,10 +19,25 @@ class Settings(BaseSettings):
     csl_series_tickers: str = ""
     discovery_interval_seconds: float = 3
     app_version: str = "0.1.0"
+    public_origin: str = "https://csltradinglab.duckdns.org"
+    auth_username: str = ""
+    auth_password_hash: str = ""
+    admin_password_hash: str = ""
+    auth_session_hours: int = 12
+    auth_remember_days: int = 30
+    admin_reauth_minutes: int = 15
+    signal_event_ticker: str = ""
+    signal_home_label: str = "CHINA"
+    signal_away_label: str = "MALDIVES"
+    realtime_signal_max_age_ms: int = 5000
+    auto_discovery_enabled: bool = False
+    match_config_path: Path = PROJECT_ROOT / "config" / "matches.v1.json"
 
     def model_post_init(self, __context) -> None:
         if not self.data_dir.is_absolute():
             self.data_dir = (PROJECT_ROOT / self.data_dir).resolve()
+        if not self.match_config_path.is_absolute():
+            self.match_config_path = (PROJECT_ROOT / self.match_config_path).resolve()
         prefix = "sqlite+aiosqlite:///./"
         if self.database_url.startswith(prefix):
             relative = self.database_url.removeprefix(prefix)

@@ -1,4 +1,5 @@
 import asyncio, csv, io, json, time, uuid, zipfile
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
 import httpx
@@ -10,6 +11,20 @@ from app.recorder import Recorder, OrderBooks
 from app.config import Settings, PROJECT_ROOT
 from app.kalshi import Discovery, KalshiEngine, group_market
 from app import main as main_module
+from app.auth import hash_password
+
+async def login_admin(client,monkeypatch,local_maker):
+    monkeypatch.setattr(main_module.auth,"maker",local_maker)
+    monkeypatch.setattr(main_module.settings,"auth_username","shared")
+    monkeypatch.setattr(main_module.settings,"auth_password_hash",hash_password("shared-password"))
+    monkeypatch.setattr(main_module.settings,"admin_password_hash",hash_password("admin-password"))
+    origin=main_module.settings.public_origin
+    login=await client.post("/api/auth/login",json={"username":"shared","password":"shared-password","remember":False},headers={"origin":origin})
+    assert login.status_code==200
+    csrf=client.cookies.get("csl_csrf")
+    elevated=await client.post("/api/auth/admin/verify",json={"password":"admin-password"},headers={"origin":origin,"x-csrf-token":csrf})
+    assert elevated.status_code==200
+    return {"origin":origin,"x-csrf-token":csrf}
 
 @pytest.mark.asyncio
 async def test_ingest_is_nonblocking_and_raw_lossless(tmp_path):
@@ -103,10 +118,9 @@ async def test_dynamic_discovery_adds_only_focus_market_without_reconnect(tmp_pa
 @pytest.mark.asyncio
 async def test_latency_ping_is_small_and_side_effect_free():
     before=main_module.recorder.health().copy()
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app),base_url="http://test") as client:
-        response=await client.post("/api/latency/ping",json={"sequence":7})
-    payload=response.json()
-    assert response.status_code==200 and len(response.content)<160
+    receive=time.time_ns(); response=await main_module.latency_ping(main_module.PingReq(sequence=7),SimpleNamespace(state=SimpleNamespace(request_entry_ts_ns=receive)))
+    payload=json.loads(response.body)
+    assert len(response.body)<160
     assert payload["sequence"]==7
     assert int(payload["server_receive_ts_ns"])<=int(payload["server_send_ts_ns"])
     assert main_module.recorder.health()==before
@@ -148,10 +162,12 @@ async def test_human_event_persistence_timestamps_replay_reference_and_calibrati
     assert [json.loads(line)["record_type"] for line in raw_lines]==["HUMAN_EVENT","HUMAN_EVENT_PERSISTENCE"]
     browser_event_id=str(uuid.uuid4()); browser_group_id=str(uuid.uuid4())
     browser_payload={"event_id":browser_event_id,"event_group_id":browser_group_id,"event_type":"BALL_IN_NET","team":"HOME","device_wall_ts_ms":time.time()*1000,"device_perf_ts_ms":101,"pointerdown_perf_ts_ms":99,"calibration_id":None,"detail":{}}
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app),base_url="http://test") as client:
-        accepted=await client.post(f"/api/sessions/{sid}/events",json=browser_payload)
+    monkeypatch.setattr(main_module.auth,"maker",local_maker)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app),base_url=main_module.settings.public_origin) as client:
+        auth_headers=await login_admin(client,monkeypatch,local_maker)
+        accepted=await client.post(f"/api/sessions/{sid}/events",json=browser_payload,headers=auth_headers)
         assert accepted.status_code==200 and accepted.json()["ok"] is True
-        duplicate=await client.post(f"/api/sessions/{sid}/events",json=browser_payload)
+        duplicate=await client.post(f"/api/sessions/{sid}/events",json=browser_payload,headers=auth_headers)
         assert duplicate.status_code==200 and duplicate.json()["duplicate"] is True
         visible=await client.get(f"/api/sessions/{sid}/data")
     assert visible.status_code==200

@@ -35,6 +35,9 @@ export type HumanEventPayload = {
   kalshi_match_clock_at_click?: unknown;
   target_event_id?: unknown;
   detail: Record<string, unknown>;
+  client_enqueue_perf_ts_ms?: number;
+  client_fetch_start_perf_ts_ms?: number;
+  authorized_event_ticker?: string;
 };
 
 type EventDraftInput = {
@@ -84,11 +87,7 @@ export function createHumanEventDraft(input: EventDraftInput, runtime: EventDraf
     target_event_id: detail.target_event_id as string | undefined,
     detail,
   };
-  return {
-    eventId,
-    eventGroupId,
-    local,
-    payload: {
+  const payload: HumanEventPayload = {
       event_id: eventId,
       event_group_id: eventGroupId,
       event_type: input.eventType,
@@ -101,8 +100,10 @@ export function createHumanEventDraft(input: EventDraftInput, runtime: EventDraf
       kalshi_match_clock_at_click: input.matchClockAtClick,
       target_event_id: detail.target_event_id,
       detail,
-    } satisfies HumanEventPayload,
+      client_enqueue_perf_ts_ms: undefined,
+      client_fetch_start_perf_ts_ms: undefined,
   };
+  return {eventId,eventGroupId,local,payload};
 }
 
 export function humanEventFromPayload(payload: HumanEventPayload): HumanEvent {
