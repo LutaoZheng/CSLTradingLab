@@ -14,6 +14,7 @@ class Session(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     score_source: Mapped[str] = mapped_column(String, default="MANUAL")
     app_version: Mapped[str] = mapped_column(String)
     git_commit: Mapped[str] = mapped_column(String, default="unknown")

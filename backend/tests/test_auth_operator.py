@@ -1,4 +1,4 @@
-import asyncio, json, time, uuid
+import asyncio, json, sqlite3, time, uuid
 from datetime import datetime, timezone
 import httpx
 import pytest
@@ -72,6 +72,89 @@ async def test_auth_roles_remember_logout_and_revocation(secured_app):
         assert (await first.get("/api/operator/bootstrap")).status_code==401
         logged_out=await admin.post("/api/auth/logout",json={},headers=csrf_headers(admin)); assert logged_out.status_code==200
         assert (await admin.get("/api/sessions")).status_code==401
+
+@pytest.mark.asyncio
+async def test_logout_revokes_only_current_device_and_expired_cookie_is_cleared(secured_app):
+    transport=httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport,base_url=ORIGIN) as first, httpx.AsyncClient(transport=transport,base_url=ORIGIN) as second:
+        assert (await login(first,"ADMIN")).status_code==200
+        assert (await login(second,"ADMIN")).status_code==200
+        first_token=first.cookies.get("csl_session")
+        logged_out=await first.post("/api/auth/logout",json={},headers=csrf_headers(first))
+        assert logged_out.status_code==200
+        assert "csl_session=" in logged_out.headers.get("set-cookie","")
+        assert (await first.get("/api/sessions")).status_code==401
+        assert (await second.get("/api/sessions")).status_code==200
+        async with secured_app() as db:
+            first_row=(await db.execute(select(AuthSession).where(AuthSession.token_hash==token_hash(first_token)))).scalar_one()
+            assert first_row.revoked_at_ns is not None
+            second_row=(await db.execute(select(AuthSession).where(AuthSession.token_hash==token_hash(second.cookies.get("csl_session"))))).scalar_one()
+            second_row.expires_at_ns=time.time_ns()-1
+            await db.commit()
+        expired_logout=await second.post("/api/auth/logout",json={},headers=csrf_headers(second))
+        assert expired_logout.status_code==200
+        assert "csl_session=" in expired_logout.headers.get("set-cookie","")
+
+@pytest.mark.asyncio
+async def test_auth_request_does_not_block_on_last_seen_sqlite_writer(secured_app):
+    maker=secured_app
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app),base_url=ORIGIN) as admin:
+        assert (await login(admin,"ADMIN")).status_code==200
+        async with maker() as db:
+            row=(await db.execute(select(AuthSession).where(AuthSession.role=="ADMIN"))).scalar_one()
+            row.last_seen_at_ns=0
+            await db.commit()
+        lock=sqlite3.connect(main_module.settings.data_dir/"auth.db",timeout=.1)
+        lock.execute("BEGIN IMMEDIATE")
+        started=time.monotonic()
+        try:
+            response=await admin.get("/api/sessions")
+            assert response.status_code==200
+            assert time.monotonic()-started<1
+        finally:
+            lock.rollback(); lock.close()
+        await asyncio.sleep(.1)
+
+@pytest.mark.asyncio
+async def test_admin_archive_restore_and_permanent_delete_preserve_other_sessions(secured_app):
+    maker=secured_app; now=datetime.now(timezone.utc); sid="historical-session"
+    raw_dir=main_module.settings.data_dir/"raw"/"match_OLD-EVENT"/sid
+    raw_dir.mkdir(parents=True); (raw_dir/"human_events.ndjson").write_text('{"historical":true}\n')
+    async with maker() as db:
+        db.add(Session(id=sid,event_ticker="OLD-EVENT",home_team="Old Home",away_team="Old Away",scheduled_start=now,created_at=now,started_at=now,ended_at=None,score_source="MANUAL",app_version="test",git_commit="test",notes="legacy inactive",session_type="MATCH_DAY",series_ticker="OLD",mock_mode=False,trading_enabled=False,kalshi_ws_status="DISCONNECTED"))
+        db.add(HumanEvent(id="old-event",event_group_id="old-group",session_id=sid,match_id="OLD-EVENT",device_wall_ts_ms=time.time()*1000,server_receive_ts_ns=time.time_ns(),event_type="VAR_CHECK",detail={},operator_session_id=None,realtime_eligible=False))
+        await db.commit()
+    transport=httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport,base_url=ORIGIN) as operator, httpx.AsyncClient(transport=transport,base_url=ORIGIN) as admin:
+        assert (await login(operator)).status_code==200
+        assert (await operator.post(f"/api/sessions/{sid}/archive",json={},headers=csrf_headers(operator))).status_code==403
+        assert (await operator.request("DELETE",f"/api/sessions/{sid}",json={"confirmation":f"DELETE {sid}"},headers=csrf_headers(operator))).status_code==403
+        assert (await login(admin,"ADMIN")).status_code==200
+        headers=csrf_headers(admin)
+        archived=await admin.post(f"/api/sessions/{sid}/archive",json={},headers=headers)
+        assert archived.status_code==200
+        default_ids={item["id"] for item in (await admin.get("/api/sessions")).json()["items"]}
+        assert sid not in default_ids and "match-session" in default_ids
+        included=(await admin.get("/api/sessions?include_archived=true")).json()
+        assert included["archived_count"]==1
+        assert next(item for item in included["items"] if item["id"]==sid)["archived_at"] is not None
+        async with maker() as db:
+            assert await db.get(HumanEvent,"old-event") is not None
+        assert raw_dir.is_dir()
+        assert (await admin.request("DELETE",f"/api/sessions/{sid}",json={"confirmation":f"DELETE {sid}"},headers=headers)).status_code==403
+        assert (await admin.post("/api/auth/admin/verify",json={"password":"admin-pass"},headers=headers)).status_code==200
+        assert (await admin.request("DELETE",f"/api/sessions/{sid}",json={"confirmation":"DELETE"},headers=headers)).status_code==400
+        restored=await admin.post(f"/api/sessions/{sid}/restore",json={},headers=headers)
+        assert restored.status_code==200
+        assert (await admin.request("DELETE",f"/api/sessions/{sid}",json={"confirmation":f"DELETE {sid}"},headers=headers)).status_code==409
+        assert (await admin.post(f"/api/sessions/{sid}/archive",json={},headers=headers)).status_code==200
+        deleted=await admin.request("DELETE",f"/api/sessions/{sid}",json={"confirmation":f"DELETE {sid}"},headers=headers)
+        assert deleted.status_code==200 and deleted.json()["deleted_rows"]["human_events"]==1
+    async with maker() as db:
+        assert await db.get(Session,sid) is None
+        assert await db.get(HumanEvent,"old-event") is None
+        assert await db.get(Session,"match-session") is not None
+    assert not raw_dir.exists()
 
 @pytest.mark.asyncio
 async def test_passwords_are_bound_to_server_side_roles_and_legacy_sessions_fail_closed(secured_app):

@@ -1,8 +1,9 @@
-import hashlib, hmac, secrets, time
+import asyncio, hashlib, hmac, logging, secrets, time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fastapi import HTTPException, Request, WebSocket
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from .models import AuthSession
 
@@ -11,6 +12,8 @@ CSRF_COOKIE="csl_csrf"
 OPERATOR_ROLE="OPERATOR"
 ADMIN_ROLE="ADMIN"
 SESSION_ROLES={OPERATOR_ROLE,ADMIN_ROLE}
+LAST_SEEN_WRITE_INTERVAL_NS=60*1_000_000_000
+logger=logging.getLogger("csl.auth")
 
 def hash_password(password:str, *, salt:bytes|None=None)->str:
     """stdlib scrypt password hash; encoded value is safe to store in the environment."""
@@ -49,7 +52,7 @@ class LoginLimiter:
 login_limiter=LoginLimiter()
 
 class AuthManager:
-    def __init__(self,maker:async_sessionmaker,cfg): self.maker=maker; self.cfg=cfg
+    def __init__(self,maker:async_sessionmaker,cfg): self.maker=maker; self.cfg=cfg; self._last_seen_scheduled={}
     @property
     def admin_username(self): return self.cfg.admin_username or self.cfg.auth_username
     def configured(self): return bool(self.cfg.operator_username and self.admin_username and self.cfg.auth_password_hash and self.cfg.admin_password_hash)
@@ -68,8 +71,21 @@ class AuthManager:
             if not row or row.revoked_at_ns is not None or row.expires_at_ns<=current or row.role not in SESSION_ROLES: raise HTTPException(401,"Session expired or revoked")
             if required_role and row.role!=required_role: raise HTTPException(403,"Insufficient role")
             if high_risk and (row.role!=ADMIN_ROLE or not row.admin_verified_until_ns or row.admin_verified_until_ns<=current): raise HTTPException(403,"Recent administrator verification required")
-            row.last_seen_at_ns=current; await db.commit()
-        return Principal(row,row.role,bool(row.admin_verified_until_ns and row.admin_verified_until_ns>current))
+            principal=Principal(row,row.role,bool(row.admin_verified_until_ns and row.admin_verified_until_ns>current))
+        # Authentication must remain read-only on the request path. A previous
+        # large Session deletion held SQLite's single writer lock and caused
+        # otherwise valid auth checks to fail while updating last_seen_at_ns.
+        if current-row.last_seen_at_ns>=LAST_SEEN_WRITE_INTERVAL_NS and current-self._last_seen_scheduled.get(row.id,0)>=LAST_SEEN_WRITE_INTERVAL_NS:
+            self._last_seen_scheduled[row.id]=current
+            asyncio.create_task(self._touch_last_seen(row.id,current))
+        return principal
+    async def _touch_last_seen(self,session_id:str,current:int):
+        try:
+            async with self.maker() as db:
+                await db.execute(update(AuthSession).where(AuthSession.id==session_id,AuthSession.last_seen_at_ns<current).values(last_seen_at_ns=current))
+                await db.commit()
+        except SQLAlchemyError as exc:
+            logger.warning("last-seen update skipped error_type=%s",type(exc).__name__)
     async def principal(self,request:Request,required_role:str|None=None,high_risk=False): return await self.principal_from_token(request.cookies.get(SESSION_COOKIE),required_role,high_risk)
     async def websocket_principal(self,ws:WebSocket,required_role:str=ADMIN_ROLE): return await self.principal_from_token(ws.cookies.get(SESSION_COOKIE),required_role)
     def validate_origin(self,request:Request):

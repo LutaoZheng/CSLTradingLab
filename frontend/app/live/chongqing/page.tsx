@@ -3,6 +3,7 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 import {ApiError,getJSON,postJSON} from '../../../lib/api';
 import {createHumanEventDraft} from '../../../lib/human-events';
 import {getBrowserOutboxStorage,HumanEventOutbox,type OutboxSnapshot} from '../../../lib/human-event-outbox';
+import {LogoutButton} from '../../components/logout-button';
 
 type Button={event_type:string;label:string;teams:string[]};
 type Match={session_id:string;event_ticker:string;home_label:string;away_label:string;start_time:string;timezone:string;allowed_event_buttons:Button[]};
@@ -18,11 +19,10 @@ export default function Chongqing(){
   function down(key:string){pointer.current[key]=performance.now()}
   function send(type:string,team?:string,key?:string,detail:Record<string,unknown>={}){if(!data?.match){setError('暂无比赛，信号未发送。');return}const enqueue=performance.now(),group=type==='EVENT_VOIDED'&&lastEvent.current?lastEvent.current.group:undefined;const draft=createHumanEventDraft({eventType:type,team,group,detail,pointerdownPerfTsMs:key?pointer.current[key]:undefined});draft.payload.client_enqueue_perf_ts_ms=enqueue;draft.payload.authorized_event_ticker=data.match.event_ticker;if(key)delete pointer.current[key];if(type!=='EVENT_VOIDED')lastEvent.current={id:draft.eventId,group:draft.eventGroupId};const queued=outbox.current?.enqueue(data.match.session_id,draft.payload);if(!queued)setError('可靠发送队列尚未就绪，请重试。');else void outbox.current?.retry(draft.eventId)}
   function correction(){if(!lastEvent.current){setError('没有可更正的上一条事件。');return}send('EVENT_VOIDED',undefined,undefined,{target_event_id:lastEvent.current.id,reason:'OPERATOR_CORRECTION'})}
-  async function logout(){await postJSON('/api/auth/logout',{});location.assign('/login')}
   const match=data?.match,server=!!data,kalshi=!!match&&!!data?.connection.kalshi_connected&&((data.connection.kalshi_message_age_ms??Infinity)<30000),buttons=match?.allowed_event_buttons||[];
   const teamButtons=buttons.filter(x=>x.teams.length),globalButtons=buttons.filter(x=>!x.teams.length&&x.event_type!=='EVENT_VOIDED'),hasCorrection=buttons.some(x=>x.event_type==='EVENT_VOIDED');
   return <main className="signal-page">
-    <header className="signal-head"><div><small>CSLTradingLab · LIVE</small><h1>{match?<>{match.home_label} <span>vs</span> {match.away_label}</>:'暂无比赛'}</h1></div><button className="text-button" onClick={logout}>退出</button></header>
+    <header className="signal-head"><div><small>CSLTradingLab · LIVE</small><h1>{match?<>{match.home_label} <span>vs</span> {match.away_label}</>:'暂无比赛'}</h1></div><LogoutButton/></header>
     <div className="connection-strip"><span className={online?'ok':'bad'}>● NETWORK {online?'ONLINE':'OFFLINE'}</span><span className={server?'ok':'bad'}>● SERVER {server?'CONNECTED':'DOWN'}</span><span className={kalshi?'ok':'bad'}>● FEED {kalshi?'LIVE':match?'STALE':'NO MATCH'}</span></div>
     {!match&&<section className="ack-card no-match"><b>暂无比赛 / NO ACTIVE MATCH</b><p className="muted">等待管理员配置并激活精确比赛合约。当前无法提交真实赛事信号。</p></section>}
     {delivery.items.length>0&&<div className="queue-warning">{delivery.items.length} EVENT{delivery.items.length>1?'S':''} WAITING TO SEND</div>}{delivery.durabilityDegraded&&<div className="queue-warning bad">LOCAL QUEUE NOT DURABLE — KEEP PAGE OPEN</div>}{error&&<p className="auth-error">{error}</p>}

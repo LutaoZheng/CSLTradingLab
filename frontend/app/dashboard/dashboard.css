@@ -1,0 +1,7 @@
+.dashboard-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.dashboard-head h1{margin-bottom:20px}
+.dashboard-head .text-button{margin-top:5px}
+.archive{background:#303640;color:#f8fafc}
+.archive-toggle{margin:18px 0;background:transparent;color:#d1d5db;border:1px solid var(--line)}
+.archived-history{opacity:.88}
+.confirm-input{width:100%;margin:10px 0;padding:13px;border:1px solid #555e6a;border-radius:10px;background:#090a0c;color:white}

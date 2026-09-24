@@ -56,10 +56,20 @@ async def security_boundary(request:Request,call_next):
         elif path=="/api/auth/me":
             try: request.state.principal=await auth.principal(request)
             except HTTPException: request.state.principal=None
-        elif path.startswith("/api/operator/") or path=="/api/auth/logout":
+        elif path=="/api/auth/logout":
+            auth.validate_origin(request)
+            try:
+                request.state.principal=await auth.principal(request)
+                auth.validate_csrf(request,request.state.principal)
+            except HTTPException as exc:
+                if exc.status_code!=401: raise
+                request.state.principal=None
+        elif path.startswith("/api/operator/"):
             request.state.principal=await auth.require(request,csrf=request.method not in {"GET","HEAD"})
         elif path=="/api/auth/admin/verify":
             request.state.principal=await auth.require(request,required_role=ADMIN_ROLE,csrf=True)
+        elif request.method=="DELETE" and path.startswith("/api/sessions/"):
+            request.state.principal=await auth.require(request,required_role=ADMIN_ROLE,csrf=True,high_risk=True)
         elif path.startswith("/api/") or path in {"/docs","/openapi.json","/redoc"}:
             request.state.principal=await auth.require(request,required_role=ADMIN_ROLE,csrf=request.method not in {"GET","HEAD"})
     except HTTPException as exc:
@@ -86,6 +96,9 @@ async def startup():
             if "role" not in auth_columns: await c.execute(text("ALTER TABLE auth_sessions ADD COLUMN role VARCHAR"))
             await c.execute(text("CREATE INDEX IF NOT EXISTS ix_auth_sessions_role ON auth_sessions(role)"))
             await c.execute(text("UPDATE auth_sessions SET revoked_at_ns=:now WHERE role IS NULL AND revoked_at_ns IS NULL"),{"now":time.time_ns()})
+            session_columns={row[1] for row in (await c.execute(text("PRAGMA table_info(experiment_sessions)"))).all()}
+            if "archived_at" not in session_columns: await c.execute(text("ALTER TABLE experiment_sessions ADD COLUMN archived_at DATETIME"))
+            await c.execute(text("CREATE INDEX IF NOT EXISTS ix_experiment_sessions_archived_at ON experiment_sessions(archived_at)"))
     await recorder.start()
 @app.on_event("shutdown")
 async def shutdown(): await kalshi.stop(); await recorder.stop(); await engine.dispose()
@@ -138,7 +151,8 @@ async def auth_me(request:Request):
 
 @app.post("/api/auth/logout")
 async def logout(request:Request):
-    await auth.revoke(request.state.principal.session.id)
+    principal=getattr(request.state,"principal",None)
+    if principal: await auth.revoke(principal.session.id)
     response=JSONResponse({"ok":True}); clear_auth_cookies(response); return response
 
 @app.post("/api/auth/admin/verify")
@@ -250,9 +264,12 @@ async def latency_ping(req:PingReq,request:Request):
     payload={"sequence":req.sequence,"server_receive_ts_ns":str(receive_ns),"server_send_ts_ns":str(send_ns)}
     return Response(content=json.dumps(payload,separators=(",",":")),media_type="application/json")
 @app.get("/api/sessions")
-async def session_history(limit:int=100):
+async def session_history(limit:int=100,include_archived:bool=False):
     async with maker() as db:
-        sessions=(await db.execute(select(Session).order_by(Session.created_at.desc()).limit(limit))).scalars().all()
+        query=select(Session)
+        if not include_archived: query=query.where(Session.archived_at.is_(None))
+        sessions=(await db.execute(query.order_by(Session.created_at.desc()).limit(limit))).scalars().all()
+        archived_count=await db.scalar(select(func.count()).select_from(Session).where(Session.archived_at.is_not(None)))
         async def counts(model):
             rows=(await db.execute(select(model.session_id,func.count()).group_by(model.session_id))).all()
             return dict(rows)
@@ -267,7 +284,7 @@ async def session_history(limit:int=100):
                 "ws_markets":kalshi.health(s.id)["subscribed_market_count"] if s.id==manual_active_session_id else 0,
             } for s in sessions]
     active=next((item for item in items if item["status"]=="ACTIVE"),None)
-    return {"items":items,"active_session":active}
+    return {"items":items,"active_session":active,"archived_count":archived_count or 0}
 @app.post("/api/sessions")
 async def start(req:StartReq):
     global manual_active_session_id
@@ -372,14 +389,31 @@ async def end_session(sid:str):
     async with focus_lock: s,changed=await _stop_session_locked(sid)
     if manual_active_session_id==sid: manual_active_session_id=None
     return {"ok":True,"changed":changed,"ended_at":s.ended_at,"focus_cleared":kalshi.session_id is None}
+@app.post("/api/sessions/{sid}/archive")
+async def archive_session(sid:str):
+    async with focus_lock:
+        if sid==manual_active_session_id: raise HTTPException(409,"Stop the active Session before archiving it")
+        async with maker() as db:
+            s=await db.get(Session,sid)
+            if not s: raise HTTPException(404,"Session not found")
+            if s.archived_at is None: s.archived_at=datetime.now(timezone.utc); await db.commit()
+            return {"ok":True,"session_id":sid,"archived_at":s.archived_at}
+@app.post("/api/sessions/{sid}/restore")
+async def restore_session(sid:str):
+    async with maker() as db:
+        s=await db.get(Session,sid)
+        if not s: raise HTTPException(404,"Session not found")
+        if s.archived_at is not None: s.archived_at=None; await db.commit()
+        return {"ok":True,"session_id":sid}
 @app.delete("/api/sessions/{sid}")
 async def delete_session(sid:str,req:DeleteReq):
     async with focus_lock:
         async with maker() as db:
             s=await db.get(Session,sid)
             if not s: raise HTTPException(404,"Session not found")
-            if s.ended_at is None: raise HTTPException(409,"Stop the active Session before deleting it")
-            if s.session_type=="MATCH_DAY" and req.confirmation!="DELETE": raise HTTPException(400,"MATCH_DAY deletion requires confirmation DELETE")
+            if sid==manual_active_session_id: raise HTTPException(409,"Stop the active Session before deleting it")
+            if s.archived_at is None: raise HTTPException(409,"Archive the Session before permanently deleting it")
+            if req.confirmation!=f"DELETE {sid}": raise HTTPException(400,"Permanent deletion requires the exact Session confirmation")
             event_ticker=s.event_ticker
         raw_dir=settings.data_dir/"raw"/f"match_{event_ticker}"/sid
         holding=settings.data_dir/".deleting"/f"{sid}-{uuid.uuid4()}"; moved=False
@@ -394,8 +428,13 @@ async def delete_session(sid:str,req:DeleteReq):
         except Exception:
             if moved: await asyncio.to_thread(shutil.move,str(holding),str(raw_dir))
             raise
-        if moved: await asyncio.to_thread(shutil.rmtree,holding)
-        return {"ok":True,"session_id":sid,"deleted_rows":deleted,"raw_directory_deleted":moved}
+        raw_directory_deleted=moved
+        if moved:
+            try: await asyncio.to_thread(shutil.rmtree,holding)
+            except OSError as exc:
+                raw_directory_deleted=False
+                logging.getLogger("csl.sessions").warning("deleted Session raw cleanup deferred session_id=%s error_type=%s",sid,type(exc).__name__)
+        return {"ok":True,"session_id":sid,"deleted_rows":deleted,"raw_directory_deleted":raw_directory_deleted}
 @app.post("/api/sessions/{sid}/events")
 async def human_event(sid:str,req:EventReq,request:Request):
     request_entry_ns=request.state.request_entry_ts_ns
@@ -454,7 +493,8 @@ async def session_data(sid:str,limit:int=200):
         calibrated_click_ns=int((e.device_wall_ts_ms+calibration.offset_ms)*1_000_000) if calibration else None
         measurements.append({"event_id":e.id,"event_type":e.event_type,"team":e.team,"calibration_id":e.calibration_id,"client_click_epoch_ms":e.device_wall_ts_ms,"client_click_perf_ms":e.device_perf_ts_ms,"pointerdown_perf_ts_ms":e.pointerdown_perf_ts_ms,"server_request_entry_ts_ns":e.server_request_entry_ts_ns,"server_receive_ts_ns":e.server_receive_ts_ns,"db_commit_complete_ts_ns":e.db_commit_complete_ts_ns,"human_raw_fsync_complete_ts_ns":e.human_raw_fsync_complete_ts_ns,"calibrated_client_click_ts_ns":calibrated_click_ns,"client_to_server_calibrated_ms":(e.server_receive_ts_ns-calibrated_click_ns)/1e6 if calibrated_click_ns else None,"request_entry_to_receive_ms":(e.server_receive_ts_ns-e.server_request_entry_ts_ns)/1e6 if e.server_request_entry_ts_ns else None,"server_receive_to_db_commit_ms":(e.db_commit_complete_ts_ns-e.server_receive_ts_ns)/1e6 if e.db_commit_complete_ts_ns else None,"db_commit_to_raw_fsync_ms":(e.human_raw_fsync_complete_ts_ns-e.db_commit_complete_ts_ns)/1e6 if e.human_raw_fsync_complete_ts_ns and e.db_commit_complete_ts_ns else None,"request_entry_to_raw_fsync_ms":(e.human_raw_fsync_complete_ts_ns-e.server_request_entry_ts_ns)/1e6 if e.human_raw_fsync_complete_ts_ns and e.server_request_entry_ts_ns else None})
     rh=recorder.health(sid); duration_end=_utc(s.ended_at) or datetime.now(timezone.utc); duration_start=_utc(s.started_at)
-    return {"session":obj(s),"status":"ACTIVE" if s.ended_at is None else "STOPPED","duration_seconds":max(0,(duration_end-duration_start).total_seconds()) if duration_start else 0,"counts":counts,"recorder":rh,"latest_calibration":obj(calibrations[0]) if calibrations else None,"measurements":measurements,"timeline":timeline}
+    runtime_status="ACTIVE" if s.id==manual_active_session_id else ("INACTIVE" if s.ended_at is None else "STOPPED")
+    return {"session":obj(s),"status":runtime_status,"duration_seconds":max(0,(duration_end-duration_start).total_seconds()) if duration_start else 0,"counts":counts,"recorder":rh,"latest_calibration":obj(calibrations[0]) if calibrations else None,"measurements":measurements,"timeline":timeline}
 @app.post("/api/sessions/{sid}/score")
 async def change_score(sid:str,req:ScoreReq):
     async with maker() as db: s=await db.get(Session,sid)
@@ -492,7 +532,8 @@ async def export(sid:str):
     started=_utc(s.started_at) or _utc(s.created_at) or datetime.now(timezone.utc)
     safe=lambda value:re.sub(r"[^A-Za-z0-9._-]+","-",value).strip("-") or "unknown"
     filename=f"CSL_{started.date().isoformat()}_{safe(s.home_team)}_vs_{safe(s.away_team)}_{sid[:8]}.zip"
-    return FileResponse(tmp_name,media_type="application/zip",filename=filename,background=BackgroundTask(Path(tmp_name).unlink,missing_ok=True),headers={"X-Session-Export-Snapshot":"active" if s.ended_at is None else "stopped"})
+    snapshot_status="active" if s.id==manual_active_session_id else ("inactive" if s.ended_at is None else "stopped")
+    return FileResponse(tmp_name,media_type="application/zip",filename=filename,background=BackgroundTask(Path(tmp_name).unlink,missing_ok=True),headers={"X-Session-Export-Snapshot":snapshot_status})
 @app.post("/api/mock/{kind}")
 async def mock(kind:str):
     if not settings.mock_mode: raise HTTPException(403)
