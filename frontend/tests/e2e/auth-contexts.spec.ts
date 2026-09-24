@@ -42,3 +42,36 @@ test('operator and admin remain isolated in independent browser contexts',async(
   await operatorContext.close();
   await adminContext.close();
 });
+
+test('admin authorizes an isolated network test and operator receives an ACK',async({browser})=>{
+  const operatorContext=await browser.newContext();
+  const adminContext=await browser.newContext();
+  const operator=await operatorContext.newPage();
+  const admin=await adminContext.newPage();
+  await signIn(operator,'operator','browser-operator-pass');
+  await signIn(admin,'michael','browser-admin-pass');
+  await expect(admin.getByText('NETWORK TEST · TEST ONLY')).toBeVisible();
+  await admin.getByRole('button',{name:'CREATE NETWORK TEST'}).click();
+  await expect(admin.getByRole('button',{name:'END TEST'})).toBeVisible();
+  await operator.getByRole('link',{name:'NETWORK TEST · TEST ONLY'}).click();
+  await expect(operator).toHaveURL(/\/live\/chongqing\/network-test$/);
+  await expect(operator.getByText('TEST AUTHORIZED')).toBeVisible();
+  await operator.getByRole('button',{name:'VPN CONFIRMED'}).click();
+  await operator.getByRole('button',{name:'CALIBRATE CLOCK'}).click();
+  await expect(operator.getByRole('button',{name:'RECALIBRATE CLOCK'})).toBeVisible();
+  await operator.getByRole('button',{name:'SEND TEST PULSE'}).click();
+  await expect(operator.getByText('ACK',{exact:true})).toBeVisible();
+  await operator.getByRole('button',{name:'DUPLICATE LAST'}).click();
+  await expect(operator.getByText('DEDUPLICATED')).toBeVisible();
+  await operatorContext.setOffline(true);
+  await operator.getByRole('button',{name:'SEND TEST PULSE'}).click();
+  await expect(operator.getByText('1 TEST EVENT IN OUTBOX')).toBeVisible();
+  await operatorContext.setOffline(false);
+  await expect(operator.getByText('1 TEST EVENT IN OUTBOX')).not.toBeVisible({timeout:10_000});
+  expect((await operatorContext.request.get('http://localhost:8000/api/network-tests/admin/runs')).status()).toBe(403);
+  await admin.getByRole('button',{name:'END TEST'}).click();
+  await expect(admin.getByRole('button',{name:'CREATE NETWORK TEST'})).toBeVisible();
+  await operator.reload();
+  await expect(operator.getByText('NO ACTIVE NETWORK TEST')).toBeVisible();
+  await operatorContext.close();await adminContext.close();
+});

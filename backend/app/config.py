@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     realtime_signal_max_age_ms: int = 5000
     auto_discovery_enabled: bool = False
     match_config_path: Path = PROJECT_ROOT / "config" / "matches.v1.json"
+    network_test_retention_days: int = 30
+    network_test_max_events_per_run: int = 600
+    network_test_run_max_minutes: int = 30
+    network_test_rate_per_minute: int = 120
+    network_test_event_max_age_ms: int = 30000
 
     def model_post_init(self, __context) -> None:
         if not self.data_dir.is_absolute():

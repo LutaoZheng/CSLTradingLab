@@ -10,6 +10,7 @@ from sqlalchemy import delete, event, func, select, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from .config import settings
 from .models import Base, Session, Market, HumanEvent, ClockCalibration, Quote, Trade, BookEvent, RawMessage, SystemEvent, AuthSession
+from .network_tests import configure as configure_network_tests, router as network_test_router
 from .recorder import Recorder
 from .kalshi import Discovery, KalshiEngine, ScoreAdapter
 from .auth import ADMIN_ROLE, OPERATOR_ROLE, AuthManager, SESSION_COOKIE, LoginLimiter, login_limiter, verify_password, set_auth_cookies, clear_auth_cookies
@@ -44,6 +45,8 @@ app=FastAPI(title="CSL Trading Lab",version=settings.app_version)
 app.add_middleware(CORSMiddleware,allow_origins=[settings.public_origin],allow_credentials=True,allow_methods=["GET","POST","DELETE"],allow_headers=["content-type","x-csrf-token"])
 auth=AuthManager(maker,settings)
 admin_limiter=LoginLimiter(limit=5,window_seconds=900)
+network_tests=configure_network_tests(maker,settings)
+app.include_router(network_test_router)
 
 @app.middleware("http")
 async def security_boundary(request:Request,call_next):
@@ -66,6 +69,10 @@ async def security_boundary(request:Request,call_next):
                 request.state.principal=None
         elif path.startswith("/api/operator/"):
             request.state.principal=await auth.require(request,csrf=request.method not in {"GET","HEAD"})
+        elif path.startswith("/api/network-tests/operator/"):
+            request.state.principal=await auth.require(request,csrf=request.method not in {"GET","HEAD"})
+        elif path.startswith("/api/network-tests/admin/"):
+            request.state.principal=await auth.require(request,required_role=ADMIN_ROLE,csrf=request.method not in {"GET","HEAD"})
         elif path=="/api/auth/admin/verify":
             request.state.principal=await auth.require(request,required_role=ADMIN_ROLE,csrf=True)
         elif request.method=="DELETE" and path.startswith("/api/sessions/"):
@@ -100,8 +107,9 @@ async def startup():
             if "archived_at" not in session_columns: await c.execute(text("ALTER TABLE experiment_sessions ADD COLUMN archived_at DATETIME"))
             await c.execute(text("CREATE INDEX IF NOT EXISTS ix_experiment_sessions_archived_at ON experiment_sessions(archived_at)"))
     await recorder.start()
+    await network_tests.cleanup()
 @app.on_event("shutdown")
-async def shutdown(): await kalshi.stop(); await recorder.stop(); await engine.dispose()
+async def shutdown(): await network_tests.shutdown(); await kalshi.stop(); await recorder.stop(); await engine.dispose()
 
 class StartReq(BaseModel): event_ticker:str; notes:str=""; session_mode:str="TEST"
 class EventReq(BaseModel):

@@ -4,6 +4,7 @@ import {ApiError,getJSON,postJSON} from '../../../lib/api';
 import {createHumanEventDraft} from '../../../lib/human-events';
 import {getBrowserOutboxStorage,HumanEventOutbox,type OutboxSnapshot} from '../../../lib/human-event-outbox';
 import {LogoutButton} from '../../components/logout-button';
+import Link from 'next/link';
 
 type Button={event_type:string;label:string;teams:string[]};
 type Match={session_id:string;event_ticker:string;home_label:string;away_label:string;start_time:string;timezone:string;allowed_event_buttons:Button[]};
@@ -25,6 +26,7 @@ export default function Chongqing(){
     <header className="signal-head"><div><small>CSLTradingLab · LIVE</small><h1>{match?<>{match.home_label} <span>vs</span> {match.away_label}</>:'暂无比赛'}</h1></div><LogoutButton/></header>
     <div className="connection-strip"><span className={online?'ok':'bad'}>● NETWORK {online?'ONLINE':'OFFLINE'}</span><span className={server?'ok':'bad'}>● SERVER {server?'CONNECTED':'DOWN'}</span><span className={kalshi?'ok':'bad'}>● FEED {kalshi?'LIVE':match?'STALE':'NO MATCH'}</span></div>
     {!match&&<section className="ack-card no-match"><b>暂无比赛 / NO ACTIVE MATCH</b><p className="muted">等待管理员配置并激活精确比赛合约。当前无法提交真实赛事信号。</p></section>}
+    <Link className="button network-test-link" href="/live/chongqing/network-test">NETWORK TEST · TEST ONLY</Link>
     {delivery.items.length>0&&<div className="queue-warning">{delivery.items.length} EVENT{delivery.items.length>1?'S':''} WAITING TO SEND</div>}{delivery.durabilityDegraded&&<div className="queue-warning bad">LOCAL QUEUE NOT DURABLE — KEEP PAGE OPEN</div>}{error&&<p className="auth-error">{error}</p>}
     <section className="signal-grid">{teamButtons.flatMap(button=>button.teams.map(team=>{const key=`${button.event_type}-${team}`,style=button.event_type==='BALL_IN_NET'?'goal':button.event_type==='PENALTY_EVENT'?'penalty':'red';return <button disabled={!match} key={key} className={`signal-button ${style}`} onPointerDown={()=>down(key)} onClick={()=>send(button.event_type,team,key)}><small>{team}</small>{button.label}</button>}))}</section>
     {globalButtons.map(button=>{const key=button.event_type;return <button disabled={!match} key={key} className="signal-button var" onPointerDown={()=>down(key)} onClick={()=>send(button.event_type,undefined,key)}>{button.label}</button>})}

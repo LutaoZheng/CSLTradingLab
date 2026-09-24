@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app import main as main_module
 from app.auth import hash_password, login_limiter, token_hash
-from app.models import AuthSession, Base, HumanEvent, Session
+from app.models import AuthSession, Base, HumanEvent, NetworkTestCalibration, NetworkTestEvent, NetworkTestRun, Session
 from app.manual_matches import load_match_config
 
 ORIGIN="https://csltradinglab.duckdns.org"
@@ -17,6 +17,8 @@ async def secured_app(tmp_path,monkeypatch):
     maker=async_sessionmaker(engine,expire_on_commit=False)
     async with engine.begin() as connection: await connection.run_sync(Base.metadata.create_all)
     monkeypatch.setattr(main_module,"maker",maker); monkeypatch.setattr(main_module.auth,"maker",maker)
+    monkeypatch.setattr(main_module.network_tests,"maker",maker)
+    main_module.network_tests.pending.clear(); main_module.network_tests.rate.clear()
     monkeypatch.setattr(main_module.settings,"data_dir",tmp_path)
     monkeypatch.setattr(main_module.settings,"public_origin",ORIGIN)
     monkeypatch.setattr(main_module.settings,"operator_username","operator")
@@ -24,6 +26,10 @@ async def secured_app(tmp_path,monkeypatch):
     monkeypatch.setattr(main_module.settings,"admin_username","")
     monkeypatch.setattr(main_module.settings,"auth_password_hash",hash_password("operator-pass"))
     monkeypatch.setattr(main_module.settings,"admin_password_hash",hash_password("admin-pass"))
+    monkeypatch.setattr(main_module.settings,"network_test_rate_per_minute",120)
+    monkeypatch.setattr(main_module.settings,"network_test_max_events_per_run",600)
+    monkeypatch.setattr(main_module.settings,"network_test_run_max_minutes",30)
+    monkeypatch.setattr(main_module.settings,"network_test_event_max_age_ms",30000)
     config_path=tmp_path/"matches.v1.json"
     config_path.write_text(json.dumps({"schema_version":1,"matches":[{"event_ticker":"CHN-MDV","home_team":"CHINA","away_team":"MALDIVES","start_time":"2026-09-24T19:00:00+08:00","timezone":"Asia/Shanghai","markets":[{"ticker":"CHN-MDV-WIN","title":"China win","group":"MATCH RESULT","direction":{"CHINA_GOAL":"YES_UP"},"settlement_rule":"test only"}],"allowed_event_buttons":[{"event_type":"BALL_IN_NET","label":"GOAL","teams":["CHINA","MALDIVES"]},{"event_type":"VAR_CHECK","label":"VAR","teams":[]},{"event_type":"EVENT_VOIDED","label":"CORRECTION","teams":[]}]}]}))
     monkeypatch.setattr(main_module.settings,"match_config_path",config_path)
@@ -34,7 +40,7 @@ async def secured_app(tmp_path,monkeypatch):
     monkeypatch.setattr(main_module,"manual_active_session_id","match-session")
     monkeypatch.setattr(main_module.kalshi,"session_id","match-session")
     yield maker
-    await asyncio.sleep(.1); await engine.dispose()
+    await main_module.network_tests.shutdown(); await engine.dispose()
 
 async def login(client,role="OPERATOR",remember=False):
     username,password=("michael","admin-pass") if role=="ADMIN" else ("operator","operator-pass")
@@ -235,3 +241,76 @@ async def test_deactivation_blocks_signals_without_deleting_history(secured_app,
     async with maker() as db:
         row=await db.get(HumanEvent,"historical"); assert row and row.server_receive_ts_ns==before
         assert await db.scalar(select(func.count()).select_from(HumanEvent))==1
+
+def network_payload(event_id=None,scenario="MANUAL",age_ms=0,calibration_id=None):
+    perf=1000.0; wall=time.time()*1000-age_ms
+    return {"event_id":event_id or str(uuid.uuid4()),"calibration_id":calibration_id,"scenario":scenario,"vpn_confirmed":True,"pointerdown_perf_ms":perf-2,"pointerdown_wall_ms":wall-2,"created_perf_ms":perf,"created_wall_ms":wall,"enqueue_perf_ms":perf+1,"enqueue_wall_ms":wall+1,"fetch_start_perf_ms":perf+2+age_ms,"fetch_start_wall_ms":wall+2+age_ms}
+
+@pytest.mark.asyncio
+async def test_network_test_role_isolation_twenty_acks_dedupe_and_no_research_pollution(secured_app):
+    maker=secured_app; transport=httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport,base_url=ORIGIN) as operator, httpx.AsyncClient(transport=transport,base_url=ORIGIN) as admin:
+        assert (await login(operator)).status_code==200
+        assert (await login(admin,"ADMIN")).status_code==200
+        assert (await operator.post("/api/network-tests/admin/runs",json={},headers=csrf_headers(operator))).status_code==403
+        created=await admin.post("/api/network-tests/admin/runs",json={"label":"isolated test","max_events":30},headers=csrf_headers(admin))
+        assert created.status_code==200
+        run_id=created.json()["run"]["test_run_id"]
+        assert (await operator.get("/api/network-tests/operator/bootstrap")).json()["active_run"]["test_run_id"]==run_id
+        ids=[]
+        for index in range(20):
+            payload=network_payload(); ids.append(payload["event_id"])
+            if index==1: payload["client_attempt_count"]=2
+            ack=await operator.post(f"/api/network-tests/operator/runs/{run_id}/events",json=payload,headers=csrf_headers(operator))
+            assert ack.status_code==200 and ack.json()["test_only"] and not ack.json()["duplicate"]
+            body=ack.json()
+            client_ack=await operator.post(f"/api/network-tests/operator/runs/{run_id}/events/{payload['event_id']}/client-ack",json={"ack_perf_ms":1005,"ack_wall_ms":time.time()*1000,"ui_update_perf_ms":1006,"ui_update_wall_ms":time.time()*1000},headers=csrf_headers(operator))
+            assert client_ack.status_code==200
+        await main_module.network_tests.shutdown()
+        duplicate=await operator.post(f"/api/network-tests/operator/runs/{run_id}/events",json=network_payload(ids[0],"DUPLICATE"),headers=csrf_headers(operator))
+        assert duplicate.status_code==200 and duplicate.json()["duplicate"]
+        summary=(await admin.get(f"/api/network-tests/admin/runs/{run_id}/summary")).json()
+        assert summary["counts"]["received"]==20 and summary["counts"]["ack"]==20 and summary["counts"]["duplicate"]==1
+        assert summary["counts"]["sent"]==22 and summary["counts"]["failed"]==1
+        assert summary["vpn"]["source"].startswith("operator confirmation")
+        assert (await operator.get(f"/api/network-tests/admin/runs/{run_id}/summary")).status_code==403
+        assert (await admin.get(f"/api/network-tests/admin/runs/{run_id}/export.csv")).status_code==200
+        assert (await admin.get(f"/api/network-tests/admin/runs/{run_id}/export.json")).json()["test_only"]
+    async with maker() as db:
+        assert await db.scalar(select(func.count()).select_from(NetworkTestEvent))==20
+        assert await db.scalar(select(func.count()).select_from(HumanEvent))==0
+        assert await db.scalar(select(func.count()).select_from(Session))==1
+
+@pytest.mark.asyncio
+async def test_network_test_calibration_expiry_mixed_runs_refresh_and_session_expiration(secured_app):
+    maker=secured_app; transport=httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport,base_url=ORIGIN) as operator, httpx.AsyncClient(transport=transport,base_url=ORIGIN) as admin:
+        await login(operator); await login(admin,"ADMIN")
+        run_id=(await admin.post("/api/network-tests/admin/runs",json={},headers=csrf_headers(admin))).json()["run"]["test_run_id"]
+        calibration_id=str(uuid.uuid4())
+        samples=[{"sequence":i,"rtt_ms":20+i,"offset_ms":5} for i in range(10)]
+        calibration={"calibration_id":calibration_id,"client_created_wall_ms":time.time()*1000,"samples":samples,"offset_ms":5,"uncertainty_ms":15,"rtt_p50_ms":24.5,"rtt_p95_ms":28.5,"rtt_p99_ms":28.9,"rtt_max_ms":29,"jitter_ms":1}
+        assert (await operator.post(f"/api/network-tests/operator/runs/{run_id}/calibrations",json=calibration,headers=csrf_headers(operator))).status_code==200
+        stale=network_payload(scenario="RECOVERY",age_ms=45000,calibration_id=calibration_id)
+        ack=await operator.post(f"/api/network-tests/operator/runs/{run_id}/events",json=stale,headers=csrf_headers(operator))
+        assert ack.status_code==200 and ack.json()["expired"]
+        await main_module.network_tests.shutdown()
+        assert (await admin.post(f"/api/network-tests/admin/runs/{run_id}/end",json={},headers=csrf_headers(admin))).status_code==200
+        next_id=(await admin.post("/api/network-tests/admin/runs",json={},headers=csrf_headers(admin))).json()["run"]["test_run_id"]
+        assert next_id!=run_id
+        assert (await operator.post(f"/api/network-tests/operator/runs/{run_id}/events",json=network_payload(),headers=csrf_headers(operator))).status_code==409
+        mixed=network_payload(calibration_id=calibration_id)
+        assert (await operator.post(f"/api/network-tests/operator/runs/{next_id}/events",json=mixed,headers=csrf_headers(operator))).status_code==400
+        async with maker() as db:
+            auth_row=(await db.execute(select(AuthSession).where(AuthSession.token_hash==token_hash(operator.cookies.get("csl_session"))))).scalar_one()
+            auth_row.expires_at_ns=time.time_ns()-1; await db.commit()
+        assert (await operator.get("/api/network-tests/operator/bootstrap")).status_code==401
+
+@pytest.mark.asyncio
+async def test_network_test_independent_rate_limit(secured_app,monkeypatch):
+    monkeypatch.setattr(main_module.settings,"network_test_rate_per_minute",2)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app),base_url=ORIGIN) as operator, httpx.AsyncClient(transport=httpx.ASGITransport(app=main_module.app),base_url=ORIGIN) as admin:
+        await login(operator); await login(admin,"ADMIN")
+        run_id=(await admin.post("/api/network-tests/admin/runs",json={},headers=csrf_headers(admin))).json()["run"]["test_run_id"]
+        for _ in range(2): assert (await operator.post(f"/api/network-tests/operator/runs/{run_id}/events",json=network_payload(),headers=csrf_headers(operator))).status_code==200
+        assert (await operator.post(f"/api/network-tests/operator/runs/{run_id}/events",json=network_payload(),headers=csrf_headers(operator))).status_code==429
