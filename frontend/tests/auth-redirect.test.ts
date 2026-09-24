@@ -35,7 +35,19 @@ test('the login route remains explicitly excluded from authentication redirects'
 test('post-login and administrator destinations remain same-origin relative paths', async () => {
   const loginSource = await import('node:fs/promises').then(fs => fs.readFile(new URL('../app/login/page.tsx', import.meta.url), 'utf8'));
   const adminSource = await import('node:fs/promises').then(fs => fs.readFile(new URL('../app/admin-verify/page.tsx', import.meta.url), 'utf8'));
+  const rootSource = await import('node:fs/promises').then(fs => fs.readFile(new URL('../app/page.tsx', import.meta.url), 'utf8'));
   assert.doesNotMatch(loginSource, /localhost/);
   assert.doesNotMatch(adminSource, /localhost/);
-  assert.match(adminSource, /router\.replace\('\/'\)/);
+  assert.match(loginSource, /router\.replace\(x\.destination\)/);
+  assert.match(adminSource, /router\.replace\(x\.destination\)/);
+  assert.match(rootSource, /router\.replace\(x\.destination/);
+});
+
+test('operator and administrator pages gate on the server-reported role', async () => {
+  const dashboardSource = await import('node:fs/promises').then(fs => fs.readFile(new URL('../app/dashboard/page.tsx', import.meta.url), 'utf8'));
+  const adminSource = await import('node:fs/promises').then(fs => fs.readFile(new URL('../app/admin-verify/page.tsx', import.meta.url), 'utf8'));
+  assert.match(dashboardSource, /x\.role!=='ADMIN'/);
+  assert.match(dashboardSource, /replace\('\/forbidden'\)/);
+  assert.match(adminSource, /x\.role!=='ADMIN'/);
+  assert.match(adminSource, /replace\('\/forbidden'\)/);
 });

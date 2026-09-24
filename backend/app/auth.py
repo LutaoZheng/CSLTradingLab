@@ -8,6 +8,9 @@ from .models import AuthSession
 
 SESSION_COOKIE="csl_session"
 CSRF_COOKIE="csl_csrf"
+OPERATOR_ROLE="OPERATOR"
+ADMIN_ROLE="ADMIN"
+SESSION_ROLES={OPERATOR_ROLE,ADMIN_ROLE}
 
 def hash_password(password:str, *, salt:bytes|None=None)->str:
     """stdlib scrypt password hash; encoded value is safe to store in the environment."""
@@ -29,7 +32,11 @@ def now_ns()->int: return time.time_ns()
 @dataclass(slots=True)
 class Principal:
     session: AuthSession
-    admin: bool
+    role: str
+    high_risk_verified: bool
+
+    @property
+    def is_admin(self)->bool: return self.role==ADMIN_ROLE
 
 class LoginLimiter:
     def __init__(self, limit=5, window_seconds=900): self.limit=limit; self.window=window_seconds; self.failures={}
@@ -43,32 +50,36 @@ login_limiter=LoginLimiter()
 
 class AuthManager:
     def __init__(self,maker:async_sessionmaker,cfg): self.maker=maker; self.cfg=cfg
-    def configured(self): return bool(self.cfg.auth_username and self.cfg.auth_password_hash and self.cfg.admin_password_hash)
-    async def create(self,remember:bool,user_agent:str|None):
+    @property
+    def admin_username(self): return self.cfg.admin_username or self.cfg.auth_username
+    def configured(self): return bool(self.cfg.operator_username and self.admin_username and self.cfg.auth_password_hash and self.cfg.admin_password_hash)
+    async def create(self,role:str,remember:bool,user_agent:str|None):
+        if role not in SESSION_ROLES: raise ValueError("Unknown session role")
         raw=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(24); created=now_ns()
         lifetime=(self.cfg.auth_remember_days*86400 if remember else self.cfg.auth_session_hours*3600)*1_000_000_000
-        row=AuthSession(id=secrets.token_hex(16),token_hash=token_hash(raw),csrf_hash=token_hash(csrf),created_at_ns=created,expires_at_ns=created+lifetime,last_seen_at_ns=created,remembered=remember,revoked_at_ns=None,admin_verified_until_ns=None,user_agent=(user_agent or "")[:300])
+        row=AuthSession(id=secrets.token_hex(16),role=role,token_hash=token_hash(raw),csrf_hash=token_hash(csrf),created_at_ns=created,expires_at_ns=created+lifetime,last_seen_at_ns=created,remembered=remember,revoked_at_ns=None,admin_verified_until_ns=None,user_agent=(user_agent or "")[:300])
         async with self.maker() as db: db.add(row); await db.commit()
         return row,raw,csrf,int(lifetime/1_000_000_000)
-    async def principal_from_token(self,raw:str|None,admin=False)->Principal:
+    async def principal_from_token(self,raw:str|None,required_role:str|None=None,high_risk=False)->Principal:
         if not raw: raise HTTPException(401,"Authentication required")
         digest=token_hash(raw); current=now_ns()
         async with self.maker() as db:
             row=(await db.execute(select(AuthSession).where(AuthSession.token_hash==digest))).scalar_one_or_none()
-            if not row or row.revoked_at_ns is not None or row.expires_at_ns<=current: raise HTTPException(401,"Session expired or revoked")
-            if admin and (not row.admin_verified_until_ns or row.admin_verified_until_ns<=current): raise HTTPException(403,"Administrator verification required")
+            if not row or row.revoked_at_ns is not None or row.expires_at_ns<=current or row.role not in SESSION_ROLES: raise HTTPException(401,"Session expired or revoked")
+            if required_role and row.role!=required_role: raise HTTPException(403,"Insufficient role")
+            if high_risk and (row.role!=ADMIN_ROLE or not row.admin_verified_until_ns or row.admin_verified_until_ns<=current): raise HTTPException(403,"Recent administrator verification required")
             row.last_seen_at_ns=current; await db.commit()
-        return Principal(row,bool(row.admin_verified_until_ns and row.admin_verified_until_ns>current))
-    async def principal(self,request:Request,admin=False): return await self.principal_from_token(request.cookies.get(SESSION_COOKIE),admin)
-    async def websocket_principal(self,ws:WebSocket,admin=True): return await self.principal_from_token(ws.cookies.get(SESSION_COOKIE),admin)
+        return Principal(row,row.role,bool(row.admin_verified_until_ns and row.admin_verified_until_ns>current))
+    async def principal(self,request:Request,required_role:str|None=None,high_risk=False): return await self.principal_from_token(request.cookies.get(SESSION_COOKIE),required_role,high_risk)
+    async def websocket_principal(self,ws:WebSocket,required_role:str=ADMIN_ROLE): return await self.principal_from_token(ws.cookies.get(SESSION_COOKIE),required_role)
     def validate_origin(self,request:Request):
         origin=request.headers.get("origin")
         if origin!=self.cfg.public_origin: raise HTTPException(403,"Origin rejected")
     def validate_csrf(self,request:Request,principal:Principal):
         cookie=request.cookies.get(CSRF_COOKIE); header=request.headers.get("x-csrf-token")
         if not cookie or not header or not hmac.compare_digest(cookie,header) or not hmac.compare_digest(token_hash(cookie),principal.session.csrf_hash): raise HTTPException(403,"CSRF validation failed")
-    async def require(self,request:Request,admin=False,csrf=False):
-        principal=await self.principal(request,admin)
+    async def require(self,request:Request,required_role:str|None=None,csrf=False,high_risk=False):
+        principal=await self.principal(request,required_role,high_risk)
         if csrf: self.validate_origin(request); self.validate_csrf(request,principal)
         return principal
     async def elevate(self,principal:Principal):

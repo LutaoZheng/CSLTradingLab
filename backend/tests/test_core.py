@@ -15,15 +15,15 @@ from app.auth import hash_password
 
 async def login_admin(client,monkeypatch,local_maker):
     monkeypatch.setattr(main_module.auth,"maker",local_maker)
-    monkeypatch.setattr(main_module.settings,"auth_username","shared")
-    monkeypatch.setattr(main_module.settings,"auth_password_hash",hash_password("shared-password"))
+    monkeypatch.setattr(main_module.settings,"operator_username","operator")
+    monkeypatch.setattr(main_module.settings,"auth_username","michael")
+    monkeypatch.setattr(main_module.settings,"admin_username","")
+    monkeypatch.setattr(main_module.settings,"auth_password_hash",hash_password("operator-password"))
     monkeypatch.setattr(main_module.settings,"admin_password_hash",hash_password("admin-password"))
     origin=main_module.settings.public_origin
-    login=await client.post("/api/auth/login",json={"username":"shared","password":"shared-password","remember":False},headers={"origin":origin})
+    login=await client.post("/api/auth/login",json={"username":"michael","password":"admin-password","remember":False},headers={"origin":origin})
     assert login.status_code==200
     csrf=client.cookies.get("csl_csrf")
-    elevated=await client.post("/api/auth/admin/verify",json={"password":"admin-password"},headers={"origin":origin,"x-csrf-token":csrf})
-    assert elevated.status_code==200
     return {"origin":origin,"x-csrf-token":csrf}
 
 @pytest.mark.asyncio

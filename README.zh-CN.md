@@ -260,7 +260,7 @@ Executable after latency/slippage?
 
 ## Phase 3 登录与重庆操作端
 
-系统现在只有一个共享基础账号。基础登录只能访问 `/live/chongqing` 的授权比赛事件界面。原 Dashboard、数据、导出、比分、重连、Session 管理 API、OpenAPI 文档和行情 WebSocket 都要求独立且短时有效的管理员二次验证；权限由 FastAPI 服务端执行，不依赖隐藏按钮。
+系统使用独立的 `OPERATOR` 和 `ADMIN` 身份。操作员只能访问 `/live/chongqing` 的授权比赛事件界面；管理员登录后进入 `/dashboard`，可以使用 Dashboard、数据、导出、比分、重连、Session 管理 API、OpenAPI 文档和行情 WebSocket。role 保存在服务端 opaque Session 中并由 FastAPI 强制执行，不依赖浏览器用户名或隐藏按钮。引入 role 之前创建的旧 Session 会 fail closed。短时管理员二次验证仅保留给未来真实交易或高风险风控修改。
 
 在服务器上交互式生成基础密码和管理员二次验证密码的 scrypt hash（终端不会显示密码）：
 
@@ -273,9 +273,10 @@ cd backend
 
 ```dotenv
 PUBLIC_ORIGIN=https://csltradinglab.duckdns.org
-AUTH_USERNAME=<共享用户名>
-AUTH_PASSWORD_HASH=<scrypt hash>
-ADMIN_PASSWORD_HASH=<不同的管理员二次验证密码 hash>
+OPERATOR_USERNAME=operator
+AUTH_USERNAME=michael
+AUTH_PASSWORD_HASH=<操作员密码 scrypt hash>
+ADMIN_PASSWORD_HASH=<管理员密码 scrypt hash>
 AUTO_DISCOVERY_ENABLED=false
 MATCH_CONFIG_PATH=./config/matches.v1.json
 TRADING_ENABLED=false

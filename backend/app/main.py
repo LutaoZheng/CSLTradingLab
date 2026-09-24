@@ -12,7 +12,7 @@ from .config import settings
 from .models import Base, Session, Market, HumanEvent, ClockCalibration, Quote, Trade, BookEvent, RawMessage, SystemEvent, AuthSession
 from .recorder import Recorder
 from .kalshi import Discovery, KalshiEngine, ScoreAdapter
-from .auth import AuthManager, SESSION_COOKIE, LoginLimiter, login_limiter, verify_password, set_auth_cookies, clear_auth_cookies
+from .auth import ADMIN_ROLE, OPERATOR_ROLE, AuthManager, SESSION_COOKIE, LoginLimiter, login_limiter, verify_password, set_auth_cookies, clear_auth_cookies
 from .manual_matches import configured_match, load_match_config
 
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -56,10 +56,12 @@ async def security_boundary(request:Request,call_next):
         elif path=="/api/auth/me":
             try: request.state.principal=await auth.principal(request)
             except HTTPException: request.state.principal=None
-        elif path.startswith("/api/operator/") or path in {"/api/auth/logout","/api/auth/admin/verify"}:
+        elif path.startswith("/api/operator/") or path=="/api/auth/logout":
             request.state.principal=await auth.require(request,csrf=request.method not in {"GET","HEAD"})
+        elif path=="/api/auth/admin/verify":
+            request.state.principal=await auth.require(request,required_role=ADMIN_ROLE,csrf=True)
         elif path.startswith("/api/") or path in {"/docs","/openapi.json","/redoc"}:
-            request.state.principal=await auth.require(request,admin=True,csrf=request.method not in {"GET","HEAD"})
+            request.state.principal=await auth.require(request,required_role=ADMIN_ROLE,csrf=request.method not in {"GET","HEAD"})
     except HTTPException as exc:
         return JSONResponse({"detail":exc.detail},status_code=exc.status_code)
     return await call_next(request)
@@ -80,6 +82,10 @@ async def startup():
                 if name not in human_columns: await c.execute(text(f"ALTER TABLE human_events ADD COLUMN {name} {column_type}"))
             await c.execute(text("CREATE INDEX IF NOT EXISTS ix_human_events_calibration_id ON human_events(calibration_id)"))
             await c.execute(text("CREATE INDEX IF NOT EXISTS ix_human_events_operator_session_id ON human_events(operator_session_id)"))
+            auth_columns={row[1] for row in (await c.execute(text("PRAGMA table_info(auth_sessions)"))).all()}
+            if "role" not in auth_columns: await c.execute(text("ALTER TABLE auth_sessions ADD COLUMN role VARCHAR"))
+            await c.execute(text("CREATE INDEX IF NOT EXISTS ix_auth_sessions_role ON auth_sessions(role)"))
+            await c.execute(text("UPDATE auth_sessions SET revoked_at_ns=:now WHERE role IS NULL AND revoked_at_ns IS NULL"),{"now":time.time_ns()})
     await recorder.start()
 @app.on_event("shutdown")
 async def shutdown(): await kalshi.stop(); await recorder.stop(); await engine.dispose()
@@ -110,20 +116,25 @@ async def login(req:LoginReq,request:Request):
     client_key=f'ip:{request.client.host if request.client else "unknown"}:{req.username.casefold()}'
     account_key=f'account:{req.username.casefold()}'
     login_limiter.check(client_key); login_limiter.check(account_key)
-    valid_user=secrets.compare_digest(req.username,settings.auth_username)
-    valid_password=verify_password(req.password,settings.auth_password_hash)
-    if not valid_user or not valid_password:
+    operator_user=secrets.compare_digest(req.username,settings.operator_username)
+    admin_user=secrets.compare_digest(req.username,auth.admin_username)
+    operator_password=verify_password(req.password,settings.auth_password_hash)
+    admin_password=verify_password(req.password,settings.admin_password_hash)
+    role=OPERATOR_ROLE if operator_user and operator_password else ADMIN_ROLE if admin_user and admin_password else None
+    if not role:
         login_limiter.fail(client_key); login_limiter.fail(account_key); raise HTTPException(401,"Invalid username or password")
     login_limiter.success(client_key); login_limiter.success(account_key)
-    row,raw,csrf,max_age=await auth.create(req.remember,request.headers.get("user-agent"))
-    response=JSONResponse({"ok":True,"authenticated":True,"admin_verified":False,"destination":"/live/chongqing"})
+    row,raw,csrf,max_age=await auth.create(role,req.remember,request.headers.get("user-agent"))
+    destination="/dashboard" if role==ADMIN_ROLE else "/live/chongqing"
+    response=JSONResponse({"ok":True,"authenticated":True,"role":role,"high_risk_verified":False,"destination":destination})
     set_auth_cookies(response,raw,csrf,max_age); response.headers["Cache-Control"]="no-store"; return response
 
 @app.get("/api/auth/me")
 async def auth_me(request:Request):
     principal=getattr(request.state,"principal",None)
-    if not principal: return {"authenticated":False,"admin_verified":False}
-    return {"authenticated":True,"admin_verified":principal.admin,"remembered":principal.session.remembered}
+    if not principal: return {"authenticated":False,"role":None,"high_risk_verified":False,"destination":"/login"}
+    destination="/dashboard" if principal.role==ADMIN_ROLE else "/live/chongqing"
+    return {"authenticated":True,"role":principal.role,"high_risk_verified":principal.high_risk_verified,"remembered":principal.session.remembered,"destination":destination}
 
 @app.post("/api/auth/logout")
 async def logout(request:Request):
@@ -136,7 +147,7 @@ async def admin_verify(req:AdminVerifyReq,request:Request):
     if not verify_password(req.password,settings.admin_password_hash): admin_limiter.fail(key); raise HTTPException(401,"Administrator verification failed")
     admin_limiter.success(key)
     until=await auth.elevate(request.state.principal)
-    return {"ok":True,"admin_verified_until_ns":str(until),"destination":"/"}
+    return {"ok":True,"high_risk_verified_until_ns":str(until),"destination":"/dashboard"}
 
 @app.post("/api/auth/sessions/revoke-others")
 async def revoke_other_sessions(request:Request):
@@ -490,7 +501,7 @@ async def mock(kind:str):
 async def ws(websocket:WebSocket):
     if websocket.headers.get("origin")!=settings.public_origin:
         await websocket.close(code=1008,reason="Origin rejected"); return
-    try: await auth.websocket_principal(websocket,admin=True)
+    try: await auth.websocket_principal(websocket,required_role=ADMIN_ROLE)
     except HTTPException:
         await websocket.close(code=1008,reason="Authentication required"); return
     await websocket.accept(); clients.add(websocket)

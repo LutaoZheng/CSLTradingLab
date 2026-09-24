@@ -118,6 +118,7 @@ class SystemEvent(Base):
 class AuthSession(Base):
     __tablename__ = "auth_sessions"
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    role: Mapped[str | None] = mapped_column(String, index=True)
     token_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
     csrf_hash: Mapped[str] = mapped_column(String)
     created_at_ns: Mapped[int] = mapped_column(BigInteger)

@@ -260,11 +260,14 @@ Security hardening → domain → HTTPS/WSS → authentication
 
 ## Phase 3 authentication and Chongqing operator surface
 
-The application now uses one shared base account. A base login can only use the
-authorized field-event surface at `/live/chongqing`. Existing dashboard, data,
-export, score, reconnect, session-management APIs, OpenAPI documentation, and
-the market-data WebSocket require a separate short-lived administrator
-verification. Authorization is enforced by FastAPI, not by page visibility.
+The application has independent `OPERATOR` and `ADMIN` identities. The operator
+can only use the authorized field-event surface at `/live/chongqing`. The
+administrator lands on `/dashboard` and may use dashboard, data, export, score,
+reconnect, session-management APIs, OpenAPI documentation, and the market-data
+WebSocket. Roles are stored in opaque server-side sessions and enforced by
+FastAPI, not by usernames in the browser or page visibility. Sessions created
+before role support fail closed. Short-lived administrator re-verification is
+retained only for future high-risk trading and risk-control changes.
 
 Generate the two password hashes interactively (the password is not echoed):
 
@@ -278,9 +281,10 @@ the server's untracked `.env`:
 
 ```dotenv
 PUBLIC_ORIGIN=https://csltradinglab.duckdns.org
-AUTH_USERNAME=<shared username>
-AUTH_PASSWORD_HASH=<scrypt hash>
-ADMIN_PASSWORD_HASH=<different scrypt hash used for administrator re-verification>
+OPERATOR_USERNAME=operator
+AUTH_USERNAME=michael
+AUTH_PASSWORD_HASH=<operator password scrypt hash>
+ADMIN_PASSWORD_HASH=<administrator password scrypt hash>
 AUTO_DISCOVERY_ENABLED=false
 MATCH_CONFIG_PATH=./config/matches.v1.json
 TRADING_ENABLED=false

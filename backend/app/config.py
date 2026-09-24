@@ -20,7 +20,9 @@ class Settings(BaseSettings):
     discovery_interval_seconds: float = 3
     app_version: str = "0.1.0"
     public_origin: str = "https://csltradinglab.duckdns.org"
+    operator_username: str = "operator"
     auth_username: str = ""
+    admin_username: str = ""
     auth_password_hash: str = ""
     admin_password_hash: str = ""
     auth_session_hours: int = 12
